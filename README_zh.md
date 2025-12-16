@@ -49,7 +49,73 @@ urdf2mjcf --help
 - `-c, --copy-meshes`: 复制 mesh 到指定目录
 - `-s, --symlink-copy`: 使用符号链接而非复制
 - `-d, --decompose`: 凸包分解目标 (visual 或 collision)
+- `-j, --json-config`: JSON 配置文件路径
 
+JSON 配置文件示例:
+```json
+{
+    "mjcf": {
+        "config": {
+            "add_default_actuator":     false,
+
+            "add_ros2_mujoco_actuator": false,
+            "add_ros2_mujoco_sensor":   false,
+            
+            "add_json_actuator":    true,
+            "add_json_sensor":      true,
+            "add_json_camera":      true
+        },
+        "compiler": { "angle": "radian", "balanceinertia": true },
+        "option": { "timestep": 0.002, "gravity": "0 0 0" },
+        "worldbody": { "add_floor": true, "add_skybox": true, "add_light": true, "add_freejoint": false },
+        "actuator": {
+            "motor":[
+                {"group": 0, "ctrlrange":"-3.1416 3.1416", "name": "shoulder_pan_joint_ACTUATOR_MOTOR",              "joint": "shoulder_pan_joint"},
+                {"group": 0, "ctrlrange":"-3.1416 3.1416", "name": "shoulder_lift_joint_ACTUATOR_MOTOR",             "joint": "shoulder_lift_joint"},
+                {"group": 0, "ctrlrange":"-3.1416 3.1416", "name": "elbow_joint_ACTUATOR_MOTOR",                     "joint": "elbow_joint"},
+                {"group": 0, "ctrlrange":"-3.1416 3.1416", "name": "wrist_1_joint_ACTUATOR_MOTOR",                   "joint": "wrist_1_joint"},
+                {"group": 0, "ctrlrange":"-3.1416 3.1416", "name": "wrist_2_joint_ACTUATOR_MOTOR",                   "joint": "wrist_2_joint"},
+                {"group": 0, "ctrlrange":"-3.1416 3.1416", "name": "wrist_3_joint_ACTUATOR_MOTOR",                   "joint": "wrist_3_joint"},
+            ],
+            "position":[
+                {"group": 1, "kp":1 , "dampratio":1, "ctrlrange":"-3.1416 3.1416", "name": "robotiq_85_left_knuckle_joint_ACTUATOR_POSITION",   "joint": "robotiq_85_left_knuckle_joint"},
+            ]
+        },
+        "sensor": {
+            "force":[
+                { "name": "ft_frame_SENSOR_FORCE", "body": "ft_frame"}
+            ],
+            "torque": [
+                { "name": "ft_frame_SENSOR_TORQUE", "body": "ft_frame"}
+            ]
+        },
+        "camera": {
+            "realsense_link" :[
+                {"name": "realsense_link_CAMERA", "mode": "fixed", "pos": "0 0 0", "euler": "0 -1.5708 -1.5708", "fovy": 75, "resolution": "640 480" }
+            ]
+        }
+    },
+    "coacd":{
+        "threshold": 0.03,
+        "max_convex_hull": 20,
+        "preprocess_mode": "auto",
+        "preprocess_resolution": 60,
+        "resolution": 3000,
+        "mcts_nodes": 20,
+        "mcts_iterations": 200,
+        "mcts_max_depth": 3,
+        "pca": true,
+        "merge": true,
+        "decimate": false,
+        "max_ch_vertex": 256,
+        "extrude": false,
+        "extrude_margin": 0.01,
+        "apx_mode": "ch",
+        "seed": 0,
+        "log_level": "error"
+        }
+}
+```
 
 ## 项目结构
 
