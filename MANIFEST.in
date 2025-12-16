@@ -1,0 +1,5 @@
+recursive-include urdf2mjcf *.py
+include urdf2mjcf/py.typed
+include README.md
+include README_zh.md
+include LICENSE

@@ -1,0 +1,62 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "urdf2mjcf"
+version = "0.1.0"
+description = "URDF to MJCF conversion tool with mesh processing and optional decomposition"
+readme = "README.md"
+requires-python = ">=3.8"
+authors = [
+    {name = "URDF2MJCF Contributors"},
+]
+license = {text = "MIT"}
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+]
+dependencies = [
+    "trimesh>=3.12.0",
+    "numpy>=1.21.0",
+]
+
+[project.optional-dependencies]
+coacd = ["coacd>=1.0.0"]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "black>=22.0",
+    "isort>=5.0",
+    "mypy>=0.990",
+    "ruff>=0.0.250",
+]
+
+[project.scripts]
+urdf2mjcf = "urdf2mjcf.cli:main"
+
+[tool.setuptools]
+packages = ["urdf2mjcf"]
+
+[tool.black]
+line-length = 100
+target-version = ['py38']
+
+[tool.isort]
+profile = "black"
+line_length = 100
+
+[tool.mypy]
+python_version = "3.8"
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+check_untyped_defs = false
+warn_unused_ignores = true
+warn_redundant_casts = true
+warn_unused_configs = true
