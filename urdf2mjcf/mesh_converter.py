@@ -502,29 +502,28 @@ class UrdfMeshProcessor:
                 geom = elem.find("geometry")
                 if geom is None:
                     continue
-                mesh_elem = geom.find("mesh")
-                if mesh_elem is None:
-                    continue
+                
+                # 修改这里：处理geometry下的所有mesh元素，而不是仅仅第一个
+                for mesh_elem in geom.findall("mesh"):
+                    filename = mesh_elem.get("filename")
+                    if not filename:
+                        continue
 
-                filename = mesh_elem.get("filename")
-                if not filename:
-                    continue
-
-                try:
-                    abs_path, scheme, pkg, rel = _resolve_mesh_path(self.input_urdf, filename)
-                    self.mesh_infos.append(
-                        MeshInfo(
-                            element=mesh_elem,
-                            abs_path=abs_path,
-                            scheme=scheme,
-                            pkg=pkg,
-                            rel_path=rel,
-                            mesh_type=mesh_type,
+                    try:
+                        abs_path, scheme, pkg, rel = _resolve_mesh_path(self.input_urdf, filename)
+                        self.mesh_infos.append(
+                            MeshInfo(
+                                element=mesh_elem,
+                                abs_path=abs_path,
+                                scheme=scheme,
+                                pkg=pkg,
+                                rel_path=rel,
+                                mesh_type=mesh_type,
+                            )
                         )
-                    )
-                    logger.debug("Found %s mesh: '%s' -> '%s'", mesh_type, filename, abs_path)
-                except Exception as e:
-                    logger.warning("Failed to resolve mesh path '%s': %s", filename, e)
+                        logger.debug("Found %s mesh: '%s' -> '%s'", mesh_type, filename, abs_path)
+                    except Exception as e:
+                        logger.warning("Failed to resolve mesh path '%s': %s", filename, e)
 
     # -------------------------
     # Decision helpers

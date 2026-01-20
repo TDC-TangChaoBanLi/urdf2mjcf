@@ -63,35 +63,66 @@ JSON 配置文件示例:
             
             "add_json_actuator":    true,
             "add_json_sensor":      true,
-            "add_json_camera":      true
+            "add_json_camera":      true,
+
+            "add_json_texture":   true,
+
+            "add_default_contact": true,
+            "add_json_contact": true
         },
         "compiler": { "angle": "radian", "balanceinertia": true },
         "option": { "timestep": 0.002, "gravity": "0 0 0" },
-        "worldbody": { "add_floor": true, "add_skybox": true, "add_light": true, "add_freejoint": false },
+        "worldbody": { 
+            "add_default_floor": true, 
+            "add_default_skybox": true, 
+            "add_default_light": true, 
+            "add_freejoint": false
+        },
         "actuator": {
             "motor":[
-                {"group": 0, "ctrlrange":"-3.1416 3.1416", "name": "shoulder_pan_joint_ACTUATOR_MOTOR",              "joint": "shoulder_pan_joint"},
-                {"group": 0, "ctrlrange":"-3.1416 3.1416", "name": "shoulder_lift_joint_ACTUATOR_MOTOR",             "joint": "shoulder_lift_joint"},
-                {"group": 0, "ctrlrange":"-3.1416 3.1416", "name": "elbow_joint_ACTUATOR_MOTOR",                     "joint": "elbow_joint"},
-                {"group": 0, "ctrlrange":"-3.1416 3.1416", "name": "wrist_1_joint_ACTUATOR_MOTOR",                   "joint": "wrist_1_joint"},
-                {"group": 0, "ctrlrange":"-3.1416 3.1416", "name": "wrist_2_joint_ACTUATOR_MOTOR",                   "joint": "wrist_2_joint"},
-                {"group": 0, "ctrlrange":"-3.1416 3.1416", "name": "wrist_3_joint_ACTUATOR_MOTOR",                   "joint": "wrist_3_joint"},
+                {"group": 0, "ctrlrange":"-150 150", "name": "ur_shoulder_pan_joint_ACTUATOR_MOTOR",              "joint": "ur_shoulder_pan_joint"},
+                {"group": 0, "ctrlrange":"-150 150", "name": "ur_shoulder_lift_joint_ACTUATOR_MOTOR",             "joint": "ur_shoulder_lift_joint"},
+                {"group": 0, "ctrlrange":"-150 150", "name": "ur_elbow_joint_ACTUATOR_MOTOR",                     "joint": "ur_elbow_joint"},
+                {"group": 0, "ctrlrange":"-28  28" , "name": "ur_wrist_1_joint_ACTUATOR_MOTOR",                   "joint": "ur_wrist_1_joint"},
+                {"group": 0, "ctrlrange":"-28  28" , "name": "ur_wrist_2_joint_ACTUATOR_MOTOR",                   "joint": "ur_wrist_2_joint"},
+                {"group": 0, "ctrlrange":"-28  28" , "name": "ur_wrist_3_joint_ACTUATOR_MOTOR",                   "joint": "ur_wrist_3_joint"},
+                {"group": 0, "ctrlrange":"-10  10" , "name": "robotiq_85_left_knuckle_joint_ACTUATOR_MOTOR",      "joint": "robotiq_85_left_knuckle_joint"}
             ],
             "position":[
-                {"group": 1, "kp":1 , "dampratio":1, "ctrlrange":"-3.1416 3.1416", "name": "robotiq_85_left_knuckle_joint_ACTUATOR_POSITION",   "joint": "robotiq_85_left_knuckle_joint"},
+                {"group": 1, "kp":200, "dampratio":1.2, "ctrlrange":"-3.1416 3.1416", "name": "ur_shoulder_pan_joint_ACTUATOR_POSITION",           "joint": "ur_shoulder_pan_joint"},
+                {"group": 1, "kp":200, "dampratio":1.2, "ctrlrange":"-3.1416 3.1416", "name": "ur_shoulder_lift_joint_ACTUATOR_POSITION",          "joint": "ur_shoulder_lift_joint"},
+                {"group": 1, "kp":100, "dampratio":1.2, "ctrlrange":"-3.1416 3.1416", "name": "ur_elbow_joint_ACTUATOR_POSITION",                  "joint": "ur_elbow_joint"},
+                {"group": 1, "kp":50,  "dampratio":1.2, "ctrlrange":"-3.1416 3.1416", "name": "ur_wrist_1_joint_ACTUATOR_POSITION",                "joint": "ur_wrist_1_joint"},
+                {"group": 1, "kp":50,  "dampratio":1.2, "ctrlrange":"-3.1416 3.1416", "name": "ur_wrist_2_joint_ACTUATOR_POSITION",                "joint": "ur_wrist_2_joint"},
+                {"group": 1, "kp":50,  "dampratio":1.2, "ctrlrange":"-3.1416 3.1416", "name": "ur_wrist_3_joint_ACTUATOR_POSITION",                "joint": "ur_wrist_3_joint"},
+                {"group": 1, "kp":10,  "dampratio":1.2, "ctrlrange":"0.0 0.7929",     "name": "robotiq_85_left_knuckle_joint_ACTUATOR_POSITION",   "joint": "robotiq_85_left_knuckle_joint"}
             ]
         },
         "sensor": {
             "force":[
-                { "name": "ft_frame_SENSOR_FORCE", "body": "ft_frame"}
+                { "name": "ur_ft_frame_SENSOR_FORCE", "body": "ur_ft_frame"}
             ],
             "torque": [
-                { "name": "ft_frame_SENSOR_TORQUE", "body": "ft_frame"}
+                { "name": "ur_ft_frame_SENSOR_TORQUE", "body": "ur_ft_frame"}
             ]
         },
         "camera": {
             "realsense_link" :[
                 {"name": "realsense_link_CAMERA", "mode": "fixed", "pos": "0 0 0", "euler": "0 -1.5708 -1.5708", "fovy": 75, "resolution": "640 480" }
+            ]
+        },
+        "texture": {
+            "cube_A_link": [
+                {"name": "cube_A_link_TEXTURE", "file": "../assets/tag36h11-100.png", "pos": "0.0 0.0 0.025", "euler": "0.0 0.0 0.0", "size": "0.05 0.05"}
+            ],
+            "cube_B_link": [
+                {"name": "cube_B_link_TEXTURE", "file": "../assets/tag36h11-101.png", "pos": "0.0 0.0 0.025", "euler": "0.0 0.0 0.0", "size": "0.05 0.05"}
+            ]
+        },
+        "contact":{
+            "exclude": [
+                {"body1": "robotiq_85_left_finger_tip_link", "body2": "robotiq_85_left_inner_knuckle_link"},
+                {"body1": "robotiq_85_right_finger_tip_link", "body2": "robotiq_85_right_inner_knuckle_link"}
             ]
         }
     },
@@ -114,6 +145,7 @@ JSON 配置文件示例:
         "seed": 0,
         "log_level": "error"
         }
+
 }
 ```
 

@@ -214,12 +214,12 @@ class ObjMeshProcessor:
         注意：不对 mesh_file 做 resolve()，因此若 mesh_file 是软链接，
               输出会出现在「软链接所在目录」下。
         """
+        import trimesh
         try:
-            import trimesh
             import coacd
         except ImportError:
-            logger.warning(
-                "convex_decompose_mesh_file requires trimesh and coacd, please install: pip install trimesh coacd"
+            logger.error(
+                "convex_decompose_mesh_file requires coacd, please install: pip install coacd"
             )
             return []
 
