@@ -54,14 +54,16 @@ Options:
 JSON config file example:
 ```json
 {
-    "mjcf": {
+    "mjcf_generator": {
         "config": {
             "add_default_actuator":     false,
 
             "add_ros2_mujoco_actuator": false,
             "add_ros2_mujoco_sensor":   false,
             
+            "add_json_option":      false,
             "add_json_actuator":    true,
+            "add_json_site":        true,
             "add_json_sensor":      true,
             "add_json_camera":      true,
 
@@ -71,12 +73,19 @@ JSON config file example:
             "add_json_contact": true
         },
         "compiler": { "angle": "radian", "balanceinertia": true },
-        "option": { "timestep": 0.002, "gravity": "0 0 0" },
+        "option": {"gravity": "0 0 0" },
         "worldbody": { 
             "add_default_floor": true, 
             "add_default_skybox": true, 
             "add_default_light": true, 
-            "add_freejoint": false
+            "add_default_freejoint": false,
+
+            "add_json_freejoint": true,
+
+            "freejoint_body":[
+                "cube_A_link", 
+                "cube_B_link"
+            ]
         },
         "actuator": {
             "motor":[
@@ -98,17 +107,22 @@ JSON config file example:
                 {"group": 1, "kp":10,  "dampratio":1.2, "ctrlrange":"0.0 0.7929",     "name": "robotiq_85_left_knuckle_joint_ACTUATOR_POSITION",   "joint": "robotiq_85_left_knuckle_joint"}
             ]
         },
+        "site":{
+            "ur_ft_frame" :[
+                {"name": "ur_ft_frame_SITE", "pos":"0 0 0", "quat": "1 0 0 0" }
+            ]
+        },
         "sensor": {
             "force":[
-                { "name": "ur_ft_frame_SENSOR_FORCE", "body": "ur_ft_frame"}
+                { "name": "ur_ft_frame_SENSOR_FORCE", "site": "ur_ft_frame_SITE"}
             ],
             "torque": [
-                { "name": "ur_ft_frame_SENSOR_TORQUE", "body": "ur_ft_frame"}
+                { "name": "ur_ft_frame_SENSOR_TORQUE", "site": "ur_ft_frame_SITE"}
             ]
         },
         "camera": {
             "realsense_link" :[
-                {"name": "realsense_link_CAMERA", "mode": "fixed", "pos": "0 0 0", "euler": "0 -1.5708 -1.5708", "fovy": 75, "resolution": "640 480" }
+                {"name": "realsense_link_CAMERA", "mode": "fixed", "pos": "0 0 0", "euler": "0 -1.5708 -1.5708", "fovy": "75", "resolution": "640 480" }
             ]
         },
         "texture": {
@@ -125,27 +139,7 @@ JSON config file example:
                 {"body1": "robotiq_85_right_finger_tip_link", "body2": "robotiq_85_right_inner_knuckle_link"}
             ]
         }
-    },
-    "coacd":{
-        "threshold": 0.03,
-        "max_convex_hull": 20,
-        "preprocess_mode": "auto",
-        "preprocess_resolution": 60,
-        "resolution": 3000,
-        "mcts_nodes": 20,
-        "mcts_iterations": 200,
-        "mcts_max_depth": 3,
-        "pca": true,
-        "merge": true,
-        "decimate": false,
-        "max_ch_vertex": 256,
-        "extrude": false,
-        "extrude_margin": 0.01,
-        "apx_mode": "ch",
-        "seed": 0,
-        "log_level": "error"
-        }
-
+    }
 }
 ```
 

@@ -26,7 +26,8 @@ from typing import Optional
 
 from .mesh_converter import mesh_converter
 from .mjcf_generator import mjcf_generator
-from .mesh_decomposer import mesh_decomposer
+# from .mesh_decomposer import mesh_decomposer
+from .urdf_parser import UrdfParser
 
 # Logger for this module
 # 本模块日志记录器
@@ -216,47 +217,40 @@ def main() -> None:
 
     total_steps = 3
 
-    # Step 1: convert meshes referenced in the URDF
-    log_step_header(1, total_steps, "Convert meshes referenced in URDF")
+    log_step_header(1, total_steps, "Parse URDF")
     try:
-        fixed_urdf_path = mesh_converter(
-            input_urdf=str(input_path),
-            mesh_dir=str(meshes_dir),
-            copy_meshes=bool(args.copy_meshes),
-            symlink_copy=bool(args.symlink_copy),
-        )
+        urdf_model = UrdfParser.parse_urdf(input_path)
+        logger.info("URDF parsing finished successfully.")
+    except Exception as e:
+        logger.error("URDF parsing failed: %s", e, exc_info=True)
+        sys.exit(1)
+
+    log_step_header(2, total_steps, "Convert meshes referenced in URDF")
+    try:
+        fixed_urdf_path = str(input_path.parent) + "/" + input_path.stem + "_fixed.urdf"
+        mesh_converter(
+                urdf_model=urdf_model, 
+                output_path=fixed_urdf_path, 
+                meshes_dir=meshes_dir, 
+                is_copy_meshes=args.copy_meshes, 
+                is_symlink_copy=args.symlink_copy
+            )
         logger.info("Mesh conversion finished successfully.")
-        logger.debug("Fixed URDF path: %s", fixed_urdf_path)
     except Exception as e:
         logger.error("Mesh conversion failed: %s", e, exc_info=True)
         sys.exit(1)
 
-    # Step 2: convert URDF to MJCF
-    log_step_header(2, total_steps, "Generate MJCF from URDF")
+    log_step_header(3, total_steps, "Generate MJCF from URDF")
     try:
         mjcf_generator(
-            urdf_path=fixed_urdf_path,
-            mjcf_path=str(output_path),
-            json_config_path=args.json_config,
-        )
+                urdf_model=urdf_model, 
+                mjcf_path=output_path, 
+                json_config_path=args.json_config
+            )
         logger.info("MJCF generation finished successfully.")
     except Exception as e:
         logger.error("MJCF generation failed: %s", e, exc_info=True)
         sys.exit(1)
-
-    # Step 3: post-process meshes (optional)
-    log_step_header(3, total_steps, "Post-process meshes (material split / convex decomposition)")
-    try:
-        mesh_decomposer(
-            xml_path=output_path,
-            decompose_target=args.decompose if args.decompose else None,
-            config_path=args.json_config,
-        )
-        logger.info("Mesh post-processing finished successfully.")
-    except Exception as e:
-        # Keep pipeline tolerant: post-process failures are non-fatal by default
-        # 保持流程容错：后处理失败默认不致命
-        logger.warning("Mesh post-processing failed (non-fatal): %s", e, exc_info=True)
 
     # Summary
     # 汇总信息

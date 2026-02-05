@@ -29,13 +29,18 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 from xml.dom import minidom
-
 import numpy as np
+
+from .urdf_parser import UrdfParser
+
 
 # IMPORTANT:
 # EN: Do NOT call logging.basicConfig() here. CLI configures logging globally.
 # CN: 不要在此模块内配置 logging.basicConfig()，由 CLI 统一配置日志风格。
 logger = logging.getLogger("urdf2mjcf.mjcf_generator")
+logger_json = logging.getLogger("urdf2mjcf.mjcf_generator.JsonParser")
+logger_urdf = logging.getLogger("urdf2mjcf.mjcf_generator.UrdfParser")
+logger_mjcf = logging.getLogger("urdf2mjcf.mjcf_generator.MjcfBuilder")
 
 
 # =============================================================================
@@ -69,189 +74,192 @@ def _safe_float(x: Optional[str], default: float = 0.0) -> float:
         return default
 
 
-def _vec3_str(x: str) -> str:
+def _str2vec(x: str) -> tuple:
     """
-    EN: Normalize "x y z" string to numeric triple.
-    CN: 将 "x y z" 字符串规范化为数值三元组格式。
+    EN: Normalize string to numeric triple.
+    CN: 将字符串规范化为数值元组格式。
     """
+    if x is None:
+        return (0.0, 0.0, 0.0)
     vals = x.split()
-    if len(vals) != 3:
-        return "0 0 0"
-    return " ".join(str(float(v)) for v in vals)
+    return tuple(float(v) for v in vals)
 
 
-def _quat_str(q: List[float]) -> str:
-    """EN: quat list -> string. CN: 四元数列表转字符串。"""
-    return f"{q[0]} {q[1]} {q[2]} {q[3]}"
-
-
-def _quat_normalize(q: List[float]) -> List[float]:
-    """EN: Normalize quaternion. CN: 归一化四元数。"""
-    n = math.sqrt(sum(v * v for v in q))
-    if n < 1e-12:
-        return [1.0, 0.0, 0.0, 0.0]
-    return [v / n for v in q]
-
-
-def _quat_multiply(q1: List[float], q2: List[float]) -> List[float]:
-    """EN: Quaternion multiply (q1 * q2). CN: 四元数乘法 (q1 * q2)。"""
-    w1, x1, y1, z1 = q1
-    w2, x2, y2, z2 = q2
-    w = w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2
-    x = w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2
-    y = w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2
-    z = w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2
-    return _quat_normalize([w, x, y, z])
-
-
-def _rpy_to_quat(rpy: str) -> List[float]:
+def _vec2str(vec: Optional[list|tuple]) -> Optional[str]:
     """
-    EN: Convert roll-pitch-yaw (rpy) string to quaternion.
-    CN: 将 rpy 字符串转换为四元数。
+    EN: Convert numeric list or tuple to space-separated string.
+    CN: 将数值列表或元组转换为空格分隔的字符串。
+    
+    :param vec: A list or tuple containing numeric values
+    :return: Space-separated string representation
     """
-    try:
-        r, p, y = map(float, rpy.split())
-    except Exception:
-        r, p, y = 0.0, 0.0, 0.0
-    cy = math.cos(y * 0.5)
-    sy = math.sin(y * 0.5)
-    cp = math.cos(p * 0.5)
-    sp = math.sin(p * 0.5)
-    cr = math.cos(r * 0.5)
-    sr = math.sin(r * 0.5)
+    if vec is None:
+        return None
+    return " ".join(str(float(v)) for v in vec)
+
+
+def _diagonalize_inertia(
+    ixx: float, iyy: float, izz: float,
+    ixy: float, ixz: float, iyz: float,
+    qw: float, qx: float, qy: float, qz: float
+) -> Tuple[Tuple[float, float, float], Tuple[float, float, float, float]]:
+    """
+    将惯量矩阵对角化，并计算对应的新四元数。
+    
+    参数:
+        ixx, iyy, izz: 原始惯量矩阵的对角元素
+        ixy, ixz, iyz: 原始惯量矩阵的非对角元素
+        qw, qx, qy, qz: 原始四元数（表示从参考坐标系到当前惯性坐标系的旋转）
+        
+    返回:
+        (new_ixx, new_iyy, new_izz): 对角化后的主转动惯量
+        (new_qw, new_qx, new_qy, new_qz): 对应的新四元数
+    """
+    def q_normalize(q: np.ndarray) -> np.ndarray:
+        n = np.linalg.norm(q)
+        if n == 0 or not np.isfinite(n):
+            raise ValueError("Invalid quaternion: norm is zero or non-finite.")
+        return q / n
+
+    def q_mul(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
+        # Hamilton product, both in (w,x,y,z)
+        w1, x1, y1, z1 = q1
+        w2, x2, y2, z2 = q2
+        return np.array([
+            w1*w2 - x1*x2 - y1*y2 - z1*z2,
+            w1*x2 + x1*w2 + y1*z2 - z1*y2,
+            w1*y2 - x1*z2 + y1*w2 + z1*x2,
+            w1*z2 + x1*y2 - y1*x2 + z1*w2
+        ], dtype=float)
+
+    def rotmat_to_quat(R: np.ndarray) -> np.ndarray:
+        # Robust conversion, returns (w,x,y,z)
+        R = np.asarray(R, dtype=float)
+        t = np.trace(R)
+        if t > 0.0:
+            s = np.sqrt(t + 1.0) * 2.0
+            w = 0.25 * s
+            x = (R[2, 1] - R[1, 2]) / s
+            y = (R[0, 2] - R[2, 0]) / s
+            z = (R[1, 0] - R[0, 1]) / s
+        else:
+            i = int(np.argmax([R[0, 0], R[1, 1], R[2, 2]]))
+            if i == 0:
+                s = np.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2]) * 2.0
+                w = (R[2, 1] - R[1, 2]) / s
+                x = 0.25 * s
+                y = (R[0, 1] + R[1, 0]) / s
+                z = (R[0, 2] + R[2, 0]) / s
+            elif i == 1:
+                s = np.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2]) * 2.0
+                w = (R[0, 2] - R[2, 0]) / s
+                x = (R[0, 1] + R[1, 0]) / s
+                y = 0.25 * s
+                z = (R[1, 2] + R[2, 1]) / s
+            else:
+                s = np.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1]) * 2.0
+                w = (R[1, 0] - R[0, 1]) / s
+                x = (R[0, 2] + R[2, 0]) / s
+                y = (R[1, 2] + R[2, 1]) / s
+                z = 0.25 * s
+        q = np.array([w, x, y, z], dtype=float)
+        # Make sign deterministic (optional but nice): keep w >= 0
+        q = q_normalize(q)
+        if q[0] < 0:
+            q = -q
+        return q
+
+    # 1) Build symmetric inertia tensor in the given frame F
+    I = np.array([
+        [ixx, ixy, ixz],
+        [ixy, iyy, iyz],
+        [ixz, iyz, izz]
+    ], dtype=float)
+
+    # Basic sanity
+    if not np.all(np.isfinite(I)):
+        raise ValueError("Inertia tensor has NaN/Inf.")
+    if np.max(np.abs(I - I.T)) > 1e-10:
+        raise ValueError("Inertia tensor must be symmetric.")
+
+    # 2) Eigen-decomposition (for symmetric matrix => orthonormal eigenvectors)
+    #    Columns of V are eigenvectors; I = V diag(w) V^T
+    evals, V = np.linalg.eigh(I)
+
+    # Sort eigenvalues (and eigenvectors) ascending (common convention)
+    order = np.argsort(evals)
+    evals = evals[order]
+    V = V[:, order]
+
+    # 3) Ensure right-handed rotation (det = +1). If det < 0, flip one axis.
+    if np.linalg.det(V) < 0:
+        V[:, -1] *= -1.0
+
+    # V maps principal frame P axes expressed in F (columns) => R_FP = V
+    R_FP = V.T
+
+    # 4) Convert R_FP to quaternion q_FP
+    q_FP = rotmat_to_quat(R_FP)
+
+    # 5) Compose with provided inertia-frame quaternion: q_BP = q_BF ⊗ q_FP
+    q_BF = q_normalize(np.array([qw, qx, qy, qz], dtype=float))
+    q_BP = q_normalize(q_mul(q_BF, q_FP))
+    if q_BP[0] < 0:
+        q_BP = -q_BP
+
+    diag = (float(evals[0]), float(evals[1]), float(evals[2]))
+    quat = (float(q_BP[0]), float(q_BP[1]), float(q_BP[2]), float(q_BP[3]))
+    return diag, quat
+
+
+def _rpy_to_quaternion(rpy: tuple, degrees=False) -> tuple:
+    """
+    将 RPY 角（绕固定轴ZYX旋转）转换为四元数（wxyz顺序）
+    
+    参数:
+    rpy: tuple|list - (roll, pitch, yaw) 弧度或度
+    degrees: bool - 如果为True，输入是度；否则是弧度
+    
+    返回:
+    tuple - 四元数 (w, x, y, z)
+    """
+    # 解包 RPY
+    roll, pitch, yaw = rpy
+    
+    # 如果输入是度，转换为弧度
+    if degrees:
+        roll = math.radians(roll)
+        pitch = math.radians(pitch)
+        yaw = math.radians(yaw)
+    
+    # 计算半角
+    cr = math.cos(roll * 0.5)
+    sr = math.sin(roll * 0.5)
+    cp = math.cos(pitch * 0.5)
+    sp = math.sin(pitch * 0.5)
+    cy = math.cos(yaw * 0.5)
+    sy = math.sin(yaw * 0.5)
+    
+    # URDF的RPY是绕固定轴旋转：Z(yaw) -> Y(pitch) -> X(roll)
+    # 对应的四元数乘法顺序是相反的： q_roll * q_pitch * q_yaw
+    
+    # 计算每个轴的四元数
+    # 绕X轴旋转（roll）
     qw = cr * cp * cy + sr * sp * sy
     qx = sr * cp * cy - cr * sp * sy
     qy = cr * sp * cy + sr * cp * sy
     qz = cr * cp * sy - sr * sp * cy
-    return _quat_normalize([qw, qx, qy, qz])
 
-
-def _rot_to_quat(R: np.ndarray) -> List[float]:
-    """EN: Rotation matrix -> quaternion. CN: 旋转矩阵转四元数。"""
-    trace = float(np.trace(R))
-    if trace > 0:
-        s = math.sqrt(trace + 1.0) * 2.0
-        qw = 0.25 * s
-        qx = (R[2, 1] - R[1, 2]) / s
-        qy = (R[0, 2] - R[2, 0]) / s
-        qz = (R[1, 0] - R[0, 1]) / s
-    elif R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
-        s = math.sqrt(1.0 + float(R[0, 0]) - float(R[1, 1]) - float(R[2, 2])) * 2.0
-        qw = (R[2, 1] - R[1, 2]) / s
-        qx = 0.25 * s
-        qy = (R[0, 1] + R[1, 0]) / s
-        qz = (R[0, 2] + R[2, 0]) / s
-    elif R[1, 1] > R[2, 2]:
-        s = math.sqrt(1.0 + float(R[1, 1]) - float(R[0, 0]) - float(R[2, 2])) * 2.0
-        qw = (R[0, 2] - R[2, 0]) / s
-        qx = (R[0, 1] + R[1, 0]) / s
-        qy = 0.25 * s
-        qz = (R[1, 2] + R[2, 1]) / s
-    else:
-        s = math.sqrt(1.0 + float(R[2, 2]) - float(R[0, 0]) - float(R[1, 1])) * 2.0
-        qw = (R[1, 0] - R[0, 1]) / s
-        qx = (R[0, 2] + R[2, 0]) / s
-        qy = (R[1, 2] + R[2, 1]) / s
-        qz = 0.25 * s
-    return _quat_normalize([qw, qx, qy, qz])
-
-
-def _diagonalize_inertia(
-    ixx: float, iyy: float, izz: float, ixy: float, ixz: float, iyz: float
-) -> Tuple[Tuple[float, float, float], List[float]]:
-    """
-    EN: Diagonalize inertia matrix to principal moments and rotation quaternion.
-    CN: 将惯性矩阵对角化，得到主惯量与旋转四元数。
-    """
-    I = np.array([[ixx, ixy, ixz], [ixy, iyy, iyz], [ixz, iyz, izz]], dtype=float)
-    w, V = np.linalg.eigh(I)
-    idx = np.argsort(w)
-    w = w[idx]
-    V = V[:, idx]
-    if np.linalg.det(V) < 0:
-        V[:, -1] *= -1.0
-    R_old_to_principal = V.T
-    q_old_to_principal = _rot_to_quat(R_old_to_principal)
-    return (float(w[0]), float(w[1]), float(w[2])), q_old_to_principal
-
-
-def _strip_file_uri(path: str) -> str:
-    """EN: Remove file:// prefix if present. CN: 去掉 file:// 前缀。"""
-    if path.startswith("file://"):
-        return path[len("file://") :]
-    return path
-
-
-def _mesh_token_from_filename(mesh_filename: str) -> str:
-    """
-    EN: Turn filename into a safe token for MJCF naming.
-    CN: 将 mesh 文件名转换为安全 token，用于 MJCF 资产命名。
-    """
-    mesh_filename = _strip_file_uri(mesh_filename)
-    base = Path(mesh_filename).name
-    base = base.replace(".", "_")
-    base = re.sub(r"[^0-9A-Za-z_]+", "_", base)
-    return base
-
-
-def _resolve_mesh_path_preserve_symlink_semantics(
-    mesh_filename: str, urdf_path: Path, mjcf_path: Path, package_map: Dict[str, str]
-) -> str:
-    """
-    EN:
-    Resolve mesh path for MJCF, but preserve symlink semantics:
-    - Do not call resolve()/realpath() on filesystem symlinks
-    - Keep absolute paths as-is
-    - Relative paths are resolved relative to URDF dir, then written as relative to MJCF dir if possible
-
-    CN:
-    解析 mesh 路径用于 MJCF，但保持“符号链接语义”：
-    - 不对符号链接做 resolve()/realpath()
-    - 绝对路径原样保留
-    - 相对路径相对 URDF 目录解析，再尽量转为相对 MJCF 输出目录的路径
-    """
-    mesh_filename = _strip_file_uri(mesh_filename)
-
-    if mesh_filename.startswith("package://"):
-        m = re.match(r"package://([^/]+)/(.+)$", mesh_filename)
-        if m:
-            pkg, rel = m.group(1), m.group(2)
-            if pkg in package_map:
-                full = Path(package_map[pkg]) / rel
-                return full.as_posix()
-            logger.warning(
-                "package:// URI not resolved (missing package_map for '%s'): %s",
-                pkg,
-                mesh_filename,
-            )
-        return mesh_filename
-
-    p = Path(mesh_filename)
-    if p.is_absolute():
-        return p.as_posix()
-
-    urdf_dir = urdf_path.parent
-    full = Path(os.path.abspath(os.path.join(str(urdf_dir), str(p))))  # no resolve
-    try:
-        rel = os.path.relpath(str(full), str(mjcf_path.parent))
-        return Path(rel).as_posix()
-    except Exception:
-        return full.as_posix()
+    norm = math.sqrt(qx * qx + qy * qy + qz * qz + qw * qw)
+    if norm < 1e-10:
+        return (1.0, 0.0, 0.0, 0.0)
+    return (qw / norm, qx / norm, qy / norm, qz / norm)
 
 
 # =============================================================================
 # Config (JSON)
 # JSON 配置
 # =============================================================================
-def _cfg_get(d: Dict[str, Any], path: str, default: Any = None) -> Any:
-    """EN: Nested dict getter. CN: 字典嵌套路径读取。"""
-    cur: Any = d
-    for key in path.split("."):
-        if not isinstance(cur, dict) or key not in cur:
-            return default
-        cur = cur[key]
-    return cur
-
 
 @dataclass
 class MjcfConfig:
@@ -265,30 +273,62 @@ class MjcfConfig:
     compiler: Dict[str, Any] = field(default_factory=dict)
     option: Dict[str, Any] = field(default_factory=dict)
     visual: Dict[str, Any] = field(default_factory=dict)
-    defaults: Dict[str, Any] = field(default_factory=dict)
+    default: Dict[str, Any] = field(default_factory=dict)
 
-    asset: Dict[str, Any] = field(default_factory=dict)
+    assets: List[Dict[str, Any]] = field(default_factory=list)
     worldbody: Dict[str, Any] = field(default_factory=dict)
-    contact: Dict[str, Any] = field(default_factory=dict)
+    contacts: List[Dict[str, Any]] = field(default_factory=list)
     actuators: List[Dict[str, Any]] = field(default_factory=list)
-    equality: Dict[str, Any] = field(default_factory=dict)
+    equalitys: List[Dict[str, Any]] = field(default_factory=list)
+    sites: List[Dict[str, Any]] = field(default_factory=list)
     sensors: List[Dict[str, Any]] = field(default_factory=list)
+    lights: List[Dict[str, Any]] = field(default_factory=list)
+
 
     cameras: List[Dict[str, Any]] = field(default_factory=list)
     textures: List[Dict[str, Any]] = field(default_factory=list)
 
-    package_map: Dict[str, str] = field(default_factory=dict)
 
     @staticmethod
-    def load(json_path: Optional[Union[str, Path]]) -> "MjcfConfig":
+    def _load_labeled_config_list(src_config: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """加载带标签的配置项"""
+        target_list:List[Dict[str, Any]] = []
+        if isinstance(src_config, dict):
+            for config_label, config_list in src_config.items():
+                if isinstance(config_list, list):
+                    for config_item in config_list:
+                        if isinstance(config_item, dict):
+                            item = config_item.copy() # config_item: {"group": 0, "ctrlrange":"-150 150", ...}
+                            item["label"] = config_label # config_label: "motor", "position", ...
+                            target_list.append(item) # item: {"label": "motor", "group": 0, "ctrlrange":"-150 150", ...}
+        return target_list
+
+    @staticmethod
+    def _cfg_get(d: Dict[str, Any], path: str, default: Any = None) -> Any:
+        """EN: Nested dict getter. CN: 字典嵌套路径读取。"""
+        cur: Any = d
+        for key in path.split("."):
+            if not isinstance(cur, dict) or key not in cur:
+                return default
+            cur = cur[key]
+        return cur
+
+    @classmethod
+    def load(cls, json_path: Optional[Union[str, Path]]) -> MjcfConfig:
         """
         EN: Load config from JSON (supports nested roots: mjcf/mujoco/urdf_to_mjcf/converter).
         CN: 从 JSON 加载配置（支持多种嵌套根节点）。
         """
-        defaults_world = {"add_default_floor": True, "add_default_skybox": True, "add_default_light": True, "add_freejoint": True}
+        
+        defaults_world = {
+                "add_default_floor": True, 
+                "add_default_skybox": True, 
+                "add_default_light": True, 
+                "add_freejoint": True
+            }
 
         if json_path is None:
-            logger.debug("No JSON config provided. Using built-in defaults.")
+            logger_json.debug("No JSON config provided. Using built-in defaults.")
             return MjcfConfig(worldbody=defaults_world.copy())
 
         p = Path(json_path)
@@ -297,655 +337,90 @@ class MjcfConfig:
 
         raw = json.loads(p.read_text(encoding="utf-8"))
 
-        root = raw
-        for k in ("mjcf", "mujoco", "urdf_to_mjcf", "converter"):
-            if isinstance(root, dict) and k in root and isinstance(root[k], dict):
-                root = root[k]
-
-        config = _cfg_get(root, "config", {}) or {}
-        if isinstance(config, dict):
-            for k, v in config.items():
-                if k in defaults_world:
-                    defaults_world[k] = v
+        # 定义 mjcf_generator json 配置的根节点
+        mjcf_config_key = "mjcf_generator"
+        if not isinstance(raw, dict):
+            logger_json.error(f"JSON config root is not a dict: {p}")
+            root = {}
+        elif mjcf_config_key not in raw:
+            logger_json.error(f"JSON config missing '{mjcf_config_key}' dict: {p}")
+            root = {}
+        elif not isinstance(raw[mjcf_config_key], dict):
+            logger_json.error(f"JSON config missing '{mjcf_config_key}' dict: {p}")
+            root = {}
         else:
-            config = defaults_world.copy()
+            root = raw[mjcf_config_key]
+            logger_json.info(f"Loading JSON config form [{mjcf_config_key}] in [{p}]")
 
-        worldbody = _cfg_get(root, "worldbody", {}) or {}
-        if isinstance(worldbody, dict):
-            for k, v in defaults_world.items():
-                worldbody.setdefault(k, v)
-        else:
-            worldbody = defaults_world.copy()
 
-        actuator = _cfg_get(root, "actuator", {}) or {}
-        sensor = _cfg_get(root, "sensor", {}) or {}
-        camera = _cfg_get(root, "camera", {}) or {}
-        texture = _cfg_get(root, "texture", {}) or {}
+        config_json = cls._cfg_get(root, "config", {}) or {}
+        cls.config = config_json
 
-        # Flatten actuator list
-        actuators: List[Dict[str, Any]] = []
-        if isinstance(actuator, dict):
-            for act_type, act_list in actuator.items():
-                if isinstance(act_list, list):
-                    for act in act_list:
-                        if isinstance(act, dict):
-                            a = act.copy()
-                            a["type"] = act_type
-                            actuators.append(a)
+        compiler_json = cls._cfg_get(root, "compiler", {}) or {}
+        cls.compiler = compiler_json
+        option_json = cls._cfg_get(root, "option", {}) or {}
+        cls.option = option_json
 
-        # Flatten sensor list
-        sensors: List[Dict[str, Any]] = []
-        if isinstance(sensor, dict):
-            for sens_type, sens_list in sensor.items():
-                if isinstance(sens_list, list):
-                    for sens in sens_list:
-                        if isinstance(sens, dict):
-                            s = sens.copy()
-                            s["type"] = sens_type
-                            sensors.append(s)
+        visuals_json = cls._cfg_get(root, "visual", {}) or {}
+        cls.visual = visuals_json
 
-        # Flatten cameras list: each cam gets "body"
-        cameras: List[Dict[str, Any]] = []
-        if isinstance(camera, dict):
-            for body_name, cam_list in camera.items():
-                if isinstance(cam_list, list):
-                    for cam in cam_list:
-                        if isinstance(cam, dict):
-                            c = cam.copy()
-                            c["body"] = body_name
-                            cameras.append(c)
+        defaults_json = cls._cfg_get(root, "defaults", {}) or {}
+        cls.default = defaults_json
 
-        # Flatten textures list
-        textures: List[Dict[str, Any]] = []
-        if isinstance(texture, dict):
-            for body_name, tex_list in texture.items():
-                if isinstance(tex_list, list):
-                    for tex in tex_list:
-                        if isinstance(tex, dict):
-                            t = tex.copy()
-                            t["body"] = body_name
-                            textures.append(t)
+        assets_json = cls._cfg_get(root, "asset", {}) or {}
+        cls.assets = cls._load_labeled_config_list(assets_json)
 
-        cfg = MjcfConfig(
-            config=config,
-            compiler=_cfg_get(root, "compiler", {}) or {},
-            option=_cfg_get(root, "option", {}) or {},
-            visual=_cfg_get(root, "visual", {}) or {},
-            defaults=_cfg_get(root, "default", _cfg_get(root, "defaults", {})) or {},
-            asset=_cfg_get(root, "asset", {}) or {},
-            worldbody=worldbody,
-            contact=_cfg_get(root, "contact", {}) or {},
-            equality=_cfg_get(root, "equality", {}) or {},
-            actuators=actuators,
-            sensors=sensors,
-            cameras=cameras,
-            textures=textures,
-            package_map=_cfg_get(root, "package_map", {}) or {},
+        worldbody_json = cls._cfg_get(root, "worldbody", {}) or {}
+        cls.worldbody = worldbody_json
+
+        contacts_json = cls._cfg_get(root, "contact", {}) or {}
+        cls.contacts = cls._load_labeled_config_list(contacts_json)
+
+        actuators_json = cls._cfg_get(root, "actuator", {}) or {}
+        cls.actuators = cls._load_labeled_config_list(actuators_json)
+
+        equalitys_json = cls._cfg_get(root, "equality", {}) or {}
+        cls.equalitys = cls._load_labeled_config_list(equalitys_json)
+
+        sites_json = cls._cfg_get(root, "site", {}) or {}
+        cls.sites = cls._load_labeled_config_list(sites_json)
+
+        sensors_json = cls._cfg_get(root, "sensor", {}) or {}
+        cls.sensors = cls._load_labeled_config_list(sensors_json)
+
+        lights_json = cls._cfg_get(root, "light", {}) or {}
+        cls.lights = cls._load_labeled_config_list(lights_json)
+
+        cameras_json = cls._cfg_get(root, "camera", {}) or {}
+        cls.cameras = cls._load_labeled_config_list(cameras_json)
+
+        textures_json = cls._cfg_get(root, "texture", {}) or {}
+        cls.textures = cls._load_labeled_config_list(textures_json)
+
+        logger_json.info(
+            "Loaded JSON config: actuators=%d, sensors=%d, cameras=%d, textures=%d, contacts=%d, equalitys=%d",
+            len(cls.actuators),
+            len(cls.sensors),
+            len(cls.cameras),
+            len(cls.textures),
+            len(cls.contacts),
+            len(cls.equalitys),
         )
-
-        logger.info(
-            "Loaded JSON config: file='%s', actuators=%d, sensors=%d, cameras=%d, textures=%d",
-            str(p),
-            len(cfg.actuators),
-            len(cfg.sensors),
-            len(cfg.cameras),
-            len(cfg.textures),
-        )
-        return cfg
-
-
-# =============================================================================
-# URDF IR (internal representation)
-# URDF 中间表示
-# =============================================================================
-@dataclass
-class UrdfMaterial:
-    name: str
-    rgba: Optional[str] = None
-
-
-@dataclass
-class UrdfGeometry:
-    kind: str  # mesh|box|cylinder|sphere
-    mesh_filename: Optional[str] = None
-    scale: Optional[str] = None
-    size: Optional[str] = None
-
-
-@dataclass
-class UrdfGeom:
-    name: str
-    origin_pos: str
-    origin_quat: str
-    geometry: UrdfGeometry
-    material_name: Optional[str] = None
-
-
-@dataclass
-class UrdfInertial:
-    pos: str
-    quat: str
-    mass: float
-    diaginertia: Tuple[float, float, float]
-
-
-@dataclass
-class UrdfJoint:
-    name: str
-    jtype: str
-    parent: str
-    child: str
-    origin_pos: str
-    origin_quat: str
-    axis: str = "0 0 1"
-    limit_lower: Optional[float] = None
-    limit_upper: Optional[float] = None
-    mimic_joint: Optional[str] = None
-    mimic_multiplier: float = 1.0
-    mimic_offset: float = 0.0
-
-
-@dataclass
-class UrdfLink:
-    name: str
-    inertial: Optional[UrdfInertial] = None
-    visuals: List[UrdfGeom] = field(default_factory=list)
-    collisions: List[UrdfGeom] = field(default_factory=list)
-
-
-# ---------- ros2_control parsing (MujocoSystem) ----------
-@dataclass
-class Ros2ControlJoint:
-    name: str
-    command_interfaces: List[str] = field(default_factory=list)
-    state_interfaces: List[str] = field(default_factory=list)
-    params: Dict[str, str] = field(default_factory=dict)
-
-
-@dataclass
-class Ros2ControlSensor:
-    name: str
-    state_interfaces: List[str] = field(default_factory=list)
-    params: Dict[str, str] = field(default_factory=dict)
-
-
-@dataclass
-class Ros2ControlInfo:
-    present: bool = False
-    plugin: str = ""
-    joints: Dict[str, Ros2ControlJoint] = field(default_factory=dict)
-    sensors: Dict[str, Ros2ControlSensor] = field(default_factory=dict)
-
-
-@dataclass
-class UrdfModel:
-    robot_name: str
-    materials: Dict[str, UrdfMaterial]
-    links: Dict[str, UrdfLink]
-    joints: Dict[str, UrdfJoint]
-    root_link: str
-    parent_map: Dict[str, List[str]]
-    child_to_joint: Dict[str, str]
-    ros2_control: Ros2ControlInfo
-
-
-class UrdfParser:
-    """
-    EN: Parse URDF XML into UrdfModel.
-    CN: 解析 URDF XML 生成 UrdfModel。
-    """
-
-    def __init__(self, urdf_path: Union[str, Path], cfg: MjcfConfig):
-        self.urdf_path = Path(urdf_path)
-        self.cfg = cfg
-        if not self.urdf_path.exists():
-            raise FileNotFoundError(f"URDF file not found: {self.urdf_path}")
-
-        self.tree = ET.parse(self.urdf_path)
-        self.robot = self.tree.getroot()
-        if self.robot is None or self.robot.tag != "robot":
-            raise ValueError("Invalid URDF: root element is not <robot>")
-
-    def parse(self) -> UrdfModel:
-        robot_name = self.robot.attrib.get("name", "converted_robot")
-        materials = self._parse_materials()
-        links = self._parse_links(materials)
-        joints, parent_map, child_to_joint = self._parse_joints()
-        root_link = self._find_root_link(links, child_to_joint)
-        ros2 = self._parse_ros2_control_mujoco_system()
-
-        logger.info(
-            "Parsed URDF: robot='%s', links=%d, joints=%d, root='%s', ros2_control=%s",
-            robot_name,
-            len(links),
-            len(joints),
-            root_link,
-            "yes" if ros2.present else "no",
-        )
-
-        return UrdfModel(
-            robot_name=robot_name,
-            materials=materials,
-            links=links,
-            joints=joints,
-            root_link=root_link,
-            parent_map=parent_map,
-            child_to_joint=child_to_joint,
-            ros2_control=ros2,
-        )
-
-    def _parse_materials(self) -> Dict[str, UrdfMaterial]:
-        mats: Dict[str, UrdfMaterial] = {}
-        for m in self.robot.findall("material"):
-            name = m.attrib.get("name")
-            if not name:
-                continue
-            rgba = None
-            color = m.find("color")
-            if color is not None:
-                rgba = color.attrib.get("rgba")
-            mats[name] = UrdfMaterial(name=name, rgba=rgba)
-
-        for link in self.robot.findall("link"):
-            for visual in link.findall("visual"):
-                vm = visual.find("material")
-                if vm is None:
-                    continue
-                name = vm.attrib.get("name")
-                if not name:
-                    continue
-                rgba = None
-                color = vm.find("color")
-                if color is not None:
-                    rgba = color.attrib.get("rgba")
-                if name not in mats:
-                    mats[name] = UrdfMaterial(name=name, rgba=rgba)
-                else:
-                    if mats[name].rgba is None and rgba is not None:
-                        mats[name].rgba = rgba
-        return mats
-
-    def _parse_links(self, materials: Dict[str, UrdfMaterial]) -> Dict[str, UrdfLink]:
-        links: Dict[str, UrdfLink] = {}
-        for link_elem in self.robot.findall("link"):
-            lname = link_elem.attrib.get("name")
-            if not lname:
-                continue
-            link = UrdfLink(name=lname)
-            link.inertial = self._parse_inertial(link_elem, lname)
-            link.visuals = self._parse_visuals(link_elem, lname, materials)
-            link.collisions = self._parse_collisions(link_elem, lname)
-            links[lname] = link
-        return links
-
-    def _parse_inertial(self, link_elem: ET.Element, link_name: str) -> Optional[UrdfInertial]:
-        inertial = link_elem.find("inertial")
-        if inertial is None:
-            return None
-
-        origin = inertial.find("origin")
-        pos = origin.attrib.get("xyz", "0 0 0") if origin is not None else "0 0 0"
-        rpy = origin.attrib.get("rpy", "0 0 0") if origin is not None else "0 0 0"
-        q_link_to_inertial = _rpy_to_quat(rpy)
-
-        mass_elem = inertial.find("mass")
-        mass = _safe_float(mass_elem.attrib.get("value") if mass_elem is not None else None, 0.0)
-
-        inertia = inertial.find("inertia")
-        if inertia is None:
-            return UrdfInertial(pos=_vec3_str(pos), quat=_quat_str(q_link_to_inertial), mass=mass, diaginertia=(0.0, 0.0, 0.0))
-
-        ixx = _safe_float(inertia.attrib.get("ixx"), 0.0)
-        iyy = _safe_float(inertia.attrib.get("iyy"), 0.0)
-        izz = _safe_float(inertia.attrib.get("izz"), 0.0)
-        ixy = _safe_float(inertia.attrib.get("ixy"), 0.0)
-        ixz = _safe_float(inertia.attrib.get("ixz"), 0.0)
-        iyz = _safe_float(inertia.attrib.get("iyz"), 0.0)
-
-        has_off = (abs(ixy) > 1e-12) or (abs(ixz) > 1e-12) or (abs(iyz) > 1e-12)
-        if not has_off:
-            return UrdfInertial(pos=_vec3_str(pos), quat=_quat_str(q_link_to_inertial), mass=mass, diaginertia=(ixx, iyy, izz))
-
-        principal, q_old_to_principal = _diagonalize_inertia(ixx, iyy, izz, ixy, ixz, iyz)
-        q_link_to_principal = _quat_multiply(q_link_to_inertial, q_old_to_principal)
-
-        logger.info("Diagonalized inertia: link='%s', principal=%s", link_name, principal)
-        return UrdfInertial(pos=_vec3_str(pos), quat=_quat_str(q_link_to_principal), mass=mass, diaginertia=principal)
-
-    def _parse_geometry(self, geom_elem: ET.Element, default_box_half: str = "0.1 0.1 0.1") -> UrdfGeometry:
-        box = geom_elem.find("box")
-        if box is not None:
-            size_full = box.attrib.get("size", "0 0 0").split()
-            if len(size_full) == 3:
-                half = [float(size_full[i]) / 2.0 for i in range(3)]
-                return UrdfGeometry(kind="box", size=f"{half[0]} {half[1]} {half[2]}")
-            return UrdfGeometry(kind="box", size=default_box_half)
-
-        cyl = geom_elem.find("cylinder")
-        if cyl is not None:
-            r = _safe_float(cyl.attrib.get("radius"), 0.1)
-            L = _safe_float(cyl.attrib.get("length"), 1.0)
-            return UrdfGeometry(kind="cylinder", size=f"{r} {L/2.0}")
-
-        sph = geom_elem.find("sphere")
-        if sph is not None:
-            r = _safe_float(sph.attrib.get("radius"), 0.1)
-            return UrdfGeometry(kind="sphere", size=f"{r}")
-
-        mesh = geom_elem.find("mesh")
-        if mesh is not None:
-            fn = mesh.attrib.get("filename")
-            sc = mesh.attrib.get("scale")
-            return UrdfGeometry(kind="mesh", mesh_filename=fn, scale=sc)
-
-        return UrdfGeometry(kind="box", size=default_box_half)
-
-    def _parse_visuals(self, link_elem: ET.Element, link_name: str, materials: Dict[str, UrdfMaterial]) -> List[UrdfGeom]:
-        out: List[UrdfGeom] = []
-        visuals = link_elem.findall("visual")
-        for i, v in enumerate(visuals):
-            origin = v.find("origin")
-            pos = origin.attrib.get("xyz", "0 0 0") if origin is not None else "0 0 0"
-            rpy = origin.attrib.get("rpy", "0 0 0") if origin is not None else "0 0 0"
-            q = _rpy_to_quat(rpy)
-
-            geom = v.find("geometry")
-            if geom is None:
-                continue
-
-            # 检查是否有多个mesh元素
-            mesh_elements = geom.findall("mesh")
-            if mesh_elements:  # 如果有mesh元素
-                for j, mesh_elem in enumerate(mesh_elements):
-                    # 直接构建UrdfGeometry对象
-                    fn = mesh_elem.attrib.get("filename")
-                    sc = mesh_elem.attrib.get("scale")
-                    g = UrdfGeometry(kind="mesh", mesh_filename=fn, scale=sc)
-
-                    mat_name = None
-                    vm = v.find("material")
-                    if vm is not None:
-                        mat_name = vm.attrib.get("name")
-
-                    # 为每个mesh创建不同的名称
-                    if len(mesh_elements) > 1:
-                        name = f"visual_{link_name}_{i}_mesh_{j}"
-                    else:
-                        name = f"visual_{link_name}_{i}" if len(visuals) > 1 else f"visual_{link_name}"
-
-                    out.append(
-                        UrdfGeom(
-                            name=name,
-                            origin_pos=_vec3_str(pos),
-                            origin_quat=_quat_str(q),
-                            geometry=g,
-                            material_name=mat_name,
-                        )
-                    )
-            else:
-                # 如果没有mesh元素，使用原来的逻辑
-                g = self._parse_geometry(geom)
-
-                mat_name = None
-                vm = v.find("material")
-                if vm is not None:
-                    mat_name = vm.attrib.get("name")
-
-                name = f"visual_{link_name}_{i}" if len(visuals) > 1 else f"visual_{link_name}"
-                out.append(
-                    UrdfGeom(
-                        name=name,
-                        origin_pos=_vec3_str(pos),
-                        origin_quat=_quat_str(q),
-                        geometry=g,
-                        material_name=mat_name,
-                    )
-                )
-        return out
-
-    def _parse_collisions(self, link_elem: ET.Element, link_name: str) -> List[UrdfGeom]:
-        out: List[UrdfGeom] = []
-        cols = link_elem.findall("collision")
-        for i, c in enumerate(cols):
-            origin = c.find("origin")
-            pos = origin.attrib.get("xyz", "0 0 0") if origin is not None else "0 0 0"
-            rpy = origin.attrib.get("rpy", "0 0 0") if origin is not None else "0 0 0"
-            q = _rpy_to_quat(rpy)
-
-            # 处理geometry元素下的所有mesh元素
-            geom = c.find("geometry")
-            if geom is None:
-                continue
-
-            # 检查是否有多个mesh元素
-            mesh_elements = geom.findall("mesh")
-            if mesh_elements:  # 如果有mesh元素
-                for j, mesh_elem in enumerate(mesh_elements):
-                    # 直接构建UrdfGeometry对象
-                    fn = mesh_elem.attrib.get("filename")
-                    sc = mesh_elem.attrib.get("scale")
-                    g = UrdfGeometry(kind="mesh", mesh_filename=fn, scale=sc)
-
-                    # 为每个mesh创建不同的名称
-                    if len(mesh_elements) > 1:
-                        name = f"collision_{link_name}_{i}_mesh_{j}"
-                    else:
-                        name = f"collision_{link_name}_{i}" if len(cols) > 1 else f"collision_{link_name}"
-
-                    out.append(
-                        UrdfGeom(
-                            name=name,
-                            origin_pos=_vec3_str(pos),
-                            origin_quat=_quat_str(q),
-                            geometry=g,
-                            material_name=None,
-                        )
-                    )
-            else:
-                # 如果没有mesh元素，使用原来的逻辑
-                g = self._parse_geometry(geom)
-
-                name = f"collision_{link_name}_{i}" if len(cols) > 1 else f"collision_{link_name}"
-                out.append(
-                    UrdfGeom(
-                        name=name,
-                        origin_pos=_vec3_str(pos),
-                        origin_quat=_quat_str(q),
-                        geometry=g,
-                        material_name=None,
-                    )
-                )
-        return out
-
-    def _parse_joints(self) -> Tuple[Dict[str, UrdfJoint], Dict[str, List[str]], Dict[str, str]]:
-        joints: Dict[str, UrdfJoint] = {}
-        parent_map: Dict[str, List[str]] = {}
-        child_to_joint: Dict[str, str] = {}
-
-        for j in self.robot.findall("joint"):
-            jname = j.attrib.get("name")
-            jtype = j.attrib.get("type", "fixed")
-            if not jname:
-                continue
-            parent = j.find("parent")
-            child = j.find("child")
-            if parent is None or child is None:
-                continue
-            p = parent.attrib.get("link")
-            c = child.attrib.get("link")
-            if not p or not c:
-                continue
-
-            origin = j.find("origin")
-            pos = origin.attrib.get("xyz", "0 0 0") if origin is not None else "0 0 0"
-            rpy = origin.attrib.get("rpy", "0 0 0") if origin is not None else "0 0 0"
-            q = _rpy_to_quat(rpy)
-
-            axis = "0 0 1"
-            axis_elem = j.find("axis")
-            if axis_elem is not None and axis_elem.attrib.get("xyz"):
-                axis = _vec3_str(axis_elem.attrib["xyz"])
-
-            lower = upper = None
-            limit = j.find("limit")
-            if limit is not None and "lower" in limit.attrib and "upper" in limit.attrib:
-                lower = _safe_float(limit.attrib.get("lower"), None)  # type: ignore
-                upper = _safe_float(limit.attrib.get("upper"), None)  # type: ignore
-
-            uj = UrdfJoint(
-                name=jname,
-                jtype=jtype,
-                parent=p,
-                child=c,
-                origin_pos=_vec3_str(pos),
-                origin_quat=_quat_str(q),
-                axis=axis,
-                limit_lower=lower,
-                limit_upper=upper,
-            )
-
-            mimic = j.find("mimic")
-            if mimic is not None and mimic.attrib.get("joint"):
-                uj.mimic_joint = mimic.attrib.get("joint")
-                uj.mimic_multiplier = _safe_float(mimic.attrib.get("multiplier"), 1.0)
-                uj.mimic_offset = _safe_float(mimic.attrib.get("offset"), 0.0)
-
-            joints[jname] = uj
-            parent_map.setdefault(p, []).append(c)
-            logger.debug("Added Parent Map: %s -> %s", p, parent_map[p])
-            child_to_joint[c] = jname
-
-        return joints, parent_map, child_to_joint
-
-    def _find_root_link(self, links: Dict[str, UrdfLink], child_to_joint: Dict[str, str]) -> str:
-        all_links = set(links.keys())
-        child_links = set(child_to_joint.keys())
-        roots = list(all_links - child_links)
-        if not roots:
-            raise ValueError("Cannot determine URDF root link (no unique root found).")
-        if len(roots) > 1:
-            logger.warning("Multiple root links detected. Using the first one: %s", roots[0])
-        return roots[0]
-
-    def _parse_ros2_control_mujoco_system(self) -> Ros2ControlInfo:
-        """
-        EN:
-        Parse all <ros2_control> blocks whose plugin is 'mujoco_ros2_control/MujocoSystem'.
-        Merge joints/sensors across blocks.
-
-        CN:
-        解析所有 plugin 为 'mujoco_ros2_control/MujocoSystem' 的 <ros2_control> 块，
-        并合并其中 joints/sensors 信息。
-        """
-        info = Ros2ControlInfo(present=False)
-
-        rc_elements: List[ET.Element] = []
-        for e in self.robot.findall("ros2_control"):
-            plugin_elem = e.find("./hardware/plugin")
-            plugin_text = (plugin_elem.text or "").strip() if plugin_elem is not None else ""
-            if plugin_text == "mujoco_ros2_control/MujocoSystem":
-                rc_elements.append(e)
-
-        if not rc_elements:
-            return info
-
-        info.present = True
-        plugin_elem = rc_elements[0].find("./hardware/plugin")
-        if plugin_elem is not None and (plugin_elem.text or "").strip():
-            info.plugin = (plugin_elem.text or "").strip()
-
-        for rc in rc_elements:
-            # joints
-            for je in rc.findall("./joint"):
-                jn = je.attrib.get("name")
-                if not jn:
-                    continue
-                rj = Ros2ControlJoint(name=jn)
-
-                for ci in je.findall("./command_interface"):
-                    n = ci.attrib.get("name")
-                    if n:
-                        rj.command_interfaces.append(n)
-
-                for si in je.findall("./state_interface"):
-                    n = si.attrib.get("name")
-                    if n:
-                        rj.state_interfaces.append(n)
-
-                for pe in je.findall("./param"):
-                    pk = pe.attrib.get("name")
-                    pv = (pe.text or "").strip()
-                    if pk:
-                        rj.params[pk] = pv
-
-                if jn in info.joints:
-                    ex = info.joints[jn]
-                    for ci in rj.command_interfaces:
-                        if ci not in ex.command_interfaces:
-                            ex.command_interfaces.append(ci)
-                    for si in rj.state_interfaces:
-                        if si not in ex.state_interfaces:
-                            ex.state_interfaces.append(si)
-                    ex.params.update(rj.params)
-                else:
-                    info.joints[jn] = rj
-
-            # sensors
-            for se in rc.findall("./sensor"):
-                sn = se.attrib.get("name")
-                if not sn:
-                    continue
-                rs = Ros2ControlSensor(name=sn)
-
-                for si in se.findall("./state_interface"):
-                    n = si.attrib.get("name")
-                    if n:
-                        rs.state_interfaces.append(n)
-
-                for pe in se.findall("./param"):
-                    pk = pe.attrib.get("name")
-                    pv = (pe.text or "").strip()
-                    if pk:
-                        rs.params[pk] = pv
-
-                if sn in info.sensors:
-                    exs = info.sensors[sn]
-                    for si in rs.state_interfaces:
-                        if si not in exs.state_interfaces:
-                            exs.state_interfaces.append(si)
-                    exs.params.update(rs.params)
-                else:
-                    info.sensors[sn] = rs
-
-        logger.info(
-            "Parsed ros2_control MujocoSystem: joints=%d, sensors=%d, plugin='%s'",
-            len(info.joints),
-            len(info.sensors),
-            info.plugin,
-        )
-        return info
-
+        return cls
 
 # =============================================================================
 # MJCF Builder
 # MJCF 构建器
 # =============================================================================
-@dataclass
-class MeshAssetInfo:
-    mesh_name: str
-    material_name: str
-    material_elem: ET.Element
-
-
 class MjcfBuilder:
     """
     EN: MJCF builder and asset/worldbody generator.
     CN: MJCF 构建器：生成 asset/worldbody/actuator/sensor 等块。
     """
 
-    def __init__(self, model_name: str, cfg: MjcfConfig, urdf_path: Path, mjcf_path: Path):
-        self.cfg = cfg
-        self.urdf_path = urdf_path
+    def __init__(self, model_name: str, json_cfg: MjcfConfig, urdf_model: UrdfParser, mjcf_path: Path):
+        self.json_cfg = json_cfg
+        self.urdf_model = urdf_model
         self.mjcf_path = mjcf_path
 
         self.root = ET.Element("mujoco", attrib={"model": model_name})
@@ -960,734 +435,845 @@ class MjcfBuilder:
         self.equality = ET.SubElement(self.root, "equality")
         self.sensor = ET.SubElement(self.root, "sensor")
 
-        self._mesh_assets: Dict[Tuple[str, str], MeshAssetInfo] = {}
-        self._mesh_kind_counter: Dict[str, int] = {"VISUAL": 0, "COLLISION": 0}
 
     # -------------------------
     # Core blocks
     # 核心块
     # -------------------------
-    def apply_core_blocks(self) -> None:
-        """EN: Apply compiler/option/visual/default/asset/contact extras. CN: 应用基础配置块。"""
-        self._apply_compiler()
-        self._apply_option()
-        self._apply_visual()
-        self._apply_default()
-        self._apply_asset_extras()
-        self._apply_contact_extras()
 
-    def _apply_compiler(self) -> None:
-        attrib = {"angle": "radian", "balanceinertia": "true"}
-        for k, v in (self.cfg.compiler or {}).items():
-            attrib[k] = str(v).lower() if isinstance(v, bool) else str(v)
-        self.compiler.attrib = attrib
 
-    def _apply_option(self) -> None:
-        attrib: Dict[str, str] = {"gravity": "0 0 -9.81"}
-        for k, v in (self.cfg.option or {}).items():
-            attrib[k] = str(v).lower() if isinstance(v, bool) else str(v)
-        self.option.attrib = attrib
+    def add_default_compiler(self) -> int:
+        """
+        添加默认 compiler 设置
+        
+        """
+        default_attrib = {"angle": "radian", "balanceinertia": "true"}
+        for k, v in (default_attrib or {}).items():
+            self.compiler.attrib[k] = str(v).lower() if isinstance(v, bool) else str(v)
+        return 1
+    
+    def add_default_option(self) -> int:
+        """
+        添加默认 option 设置
+        
+        """
+        default_attrib = {"gravity": "0 0 -9.81"}
+        for k, v in (default_attrib or {}).items():
+            self.option.attrib[k] = str(v).lower() if isinstance(v, bool) else str(v)
+        return 1
 
-    def _apply_visual(self) -> None:
-        self.visual.clear()
-        vcfg = self.cfg.visual or {}
-        if not vcfg:
-            return
-        for block_name, block_value in vcfg.items():
-            if not isinstance(block_value, dict):
-                g = self.visual.find("global")
-                if g is None:
-                    g = ET.SubElement(self.visual, "global")
-                g.attrib[block_name] = str(block_value)
+    def add_default_visual(self) -> int:
+        """
+        添加默认 visual 配置
+        
+        """
+        default_visual = """
+            <visual>
+                <global offwidth="640" offheight="480"/>
+                <quality shadowsize="4096"/>
+            </visual>
+        """
+        visual_elem = ET.fromstring(default_visual)
+        for sub_elem in visual_elem:
+            self.visual.append(sub_elem)
+        return 1
+    
+    def add_default_default(self) -> int:
+        """
+        添加默认 default 配置
+        
+        """
+        default_default = """
+            <default>
+                <default class="robot">
+                    <default class="visual">
+                        <geom contype="0" conaffinity="0" group="1"/>
+                    </default>
+                    <default class="collision">
+                        <geom contype="1" conaffinity="1" group="2" condim="6"/>
+                    </default>
+                </default>
+            </default>
+        """
+        default_elem = ET.fromstring(default_default)
+        for sub_elem in default_elem:
+            self.default.append(sub_elem)
+        return 1
+
+
+    def add_default_worldbody_floor(self) -> int:
+        """
+        添加默认 floor 配置
+        
+        """
+        default_floor_geom = """
+            <geom name="floor" type="plane" size="0 0 0.05" material="floor"/>
+        """
+        default_floor_material = """
+            <material name="floor" texture="floor" texuniform="true" texrepeat="5 5" reflectance="0.2"/>
+        """
+        default_floor_texture = """
+            <texture name="floor" type="2d" builtin="checker" mark="edge" rgb1="0.2 0.3 0.4" rgb2="0.1 0.2 0.3" markrgb="0.8 0.8 0.8" width="300" height="300"/>
+        """
+        self.worldbody.append(ET.fromstring(default_floor_geom))
+        self.asset.append(ET.fromstring(default_floor_material))
+        self.asset.append(ET.fromstring(default_floor_texture))
+        return 1
+
+
+    def add_default_worldbody_skybox(self) -> int:
+        """
+        添加默认 skybox 配置
+        
+        """
+        default_skybox = """
+            <texture name="skybox" type="skybox" builtin="gradient" rgb1=".3 .5 .7" rgb2="0 0 0" width="1024" height="1024"/>
+        """
+        self.asset.append(ET.fromstring(default_skybox))
+        return 1
+
+
+    def add_default_worldbody_light(self) -> int:
+        """
+        添加默认 light 配置
+        
+        """
+        default_light = """
+            <light name="default_light" pos="0 0 10" dir="0 0 -1" directional="true"/>
+        """
+        self.worldbody.append(ET.fromstring(default_light))
+        return 1
+
+
+    def add_default_worldbody_freejoint(self) -> int:
+        """
+        添加默认 freejoint 配置
+        
+        """
+        default_freejoint = """
+            <freejoint/>
+        """
+        worldbody_bodies = self.worldbody.findall("body")
+        for worldbody_body in worldbody_bodies:
+            worldbody_body.append(ET.fromstring(default_freejoint))
+        return 1
+
+
+    def add_json_compiler(self) -> int:
+        """
+        添加 json 文件中的 compiler 配置
+        
+        """
+        add_num = 0
+        json_attrib = self.json_cfg.compiler or {}
+        for k, v in (json_attrib or {}).items():
+            self.compiler.attrib[k] = str(v).lower() if isinstance(v, bool) else str(v)
+            add_num += 1
+        logger_mjcf.debug(f"Added compiler from json: {len(json_attrib)} attributes")
+        return add_num
+
+    def add_json_option(self) -> int:
+        """
+        添加 json 文件中的 option 配置
+        
+        """
+        add_num = 0
+        json_attrib = self.json_cfg.option or {}
+        for k, v in (json_attrib or {}).items():
+            self.option.attrib[k] = str(v).lower() if isinstance(v, bool) else str(v)
+            add_num += 1
+        logger_mjcf.debug(f"Added option from json: {len(json_attrib)} attributes")
+        return add_num
+
+    def add_json_visual(self) -> int:
+        """
+        添加 json 文件中的 visual 配置
+        
+        """
+        add_num = 0
+        json_visual = self.json_cfg.visual or {}
+        for label, attribs in json_visual.items():
+            sub_elem = ET.SubElement(self.visual, label)
+            for k, v in (attribs or {}).items():
+                sub_elem.attrib[k] = str(v).lower() if isinstance(v, bool) else str(v)
+            add_num += 1
+            logger_mjcf.debug(f"Added visual from json. label: {label}, num: {len(attribs)}")
+        return add_num
+
+
+    def add_json_default(self) -> int:
+        """
+        添加 json 文件中的 default 配置
+        
+        """
+        json_default = self.json_cfg.default or {}
+        pass
+
+    @staticmethod
+    def __add_json_list_configs_label(parent: ET.Element[str], configs_list: List[Dict[str, Any]]) -> int:
+        """
+        添加 json 文件中的列表配置
+        
+        parent: 父级元素
+        configs_list: 列表配置
+        """
+        add_num = 0
+        for config in configs_list: # config: {"label": "material", "name": "test_material_1", "rgba": [1, 0, 0, 1]}
+            label = config.get("label")
+            attribs = {k: v for k, v in config.items() if k != "label"}
+            ET.SubElement(parent, label, attrib={k: str(v) for k, v in attribs.items()})
+            logger_mjcf.debug(f"Added {label} from json. name: {config.get('name')}, num: {len(attribs)}")
+            add_num += 1
+        return add_num
+
+    def add_json_asset(self) -> int:
+        """
+        添加 json 文件中的 asset 配置
+        
+        """
+        json_assets = self.json_cfg.assets or []
+        add_num = self.__add_json_list_configs_label(self.asset, json_assets)
+        logger_mjcf.debug(f"Added asset from json: {len(json_assets)} assets")
+        return add_num
+        
+
+    def add_json_contact(self) -> int:
+        """
+        添加 json 文件中的 contact 配置
+        
+        """
+        json_contact = self.json_cfg.contacts or []
+        add_num = self.__add_json_list_configs_label(self.contact, json_contact)
+        logger_mjcf.debug(f"Added contact from json: {len(json_contact)} contacts")
+        return add_num
+
+    def add_json_actuator(self) -> int:
+        """
+        添加 json 文件中的 actuator 配置
+        
+        """
+        json_actuator = self.json_cfg.actuators or []
+        add_num = self.__add_json_list_configs_label(self.actuator, json_actuator)
+        logger_mjcf.debug(f"Added actuator from json: {len(json_actuator)} actuators")
+        return add_num
+
+    def add_json_sensor(self) -> int:
+        """
+        添加 json 文件中的 sensor 配置
+        
+        """
+        json_sensor = self.json_cfg.sensors or []
+        add_num = self.__add_json_list_configs_label(self.sensor, json_sensor)
+        logger_mjcf.debug(f"Added sensor from json: {len(json_sensor)} sensors")
+        return add_num
+        
+    @staticmethod
+    def __find_body_by_name(parent: ET.Element[str], name: str) -> Optional[ET.Element[str]]:
+        """
+        根据名称递归查找 body 元素
+
+        :param parent: 父元素
+        :param name: body 名称
+        
+        """
+        # 检查父元素是否为 body 或 worldbody
+        if parent.tag not in ("body", "worldbody"):
+            return None
+        
+        # 检查当前元素是否匹配
+        if parent.tag == "body" and parent.attrib.get("name") == name:
+            return parent
+
+        # 遍历所有子元素
+        for child in parent:
+            if child.tag == "body" and child.attrib.get("name") == name:
+                return child
+            # 递归搜索子元素
+            result = MjcfBuilder.__find_body_by_name(child, name)
+            if result is not None:
+                return result
+        
+        return None
+    
+    @staticmethod
+    def __add_json_list_configs_body(worldbody: ET.Element[str], configs_list: List[Dict[str, Any]], label: str) -> int:
+        """
+        添加 json 文件中的列表配置
+
+        :param configs_list: 列表配置
+        
+        """
+        add_num = 0
+        for config in configs_list: # config: {"label": "ur_ft_frame", "name": "ur_ft_frame_SITE", "pos":"0 0 0", "quat": "1 0 0 0" }
+            parent_body_name = config.get("label")
+            if parent_body_name == "worldbody":
+                parent = worldbody
+            else:
+                parent = MjcfBuilder.__find_body_by_name(worldbody, parent_body_name)
+            # label = config.get("label")
+            attribs = {k: v for k, v in config.items() if k != "label"}
+            if parent is None:
+                logger_mjcf.error(f"Can not find body: {parent_body_name} when add {label}")
                 continue
-            blk = ET.SubElement(self.visual, block_name)
-            for k, v in block_value.items():
-                blk.attrib[k] = str(v).lower() if isinstance(v, bool) else str(v)
+            ET.SubElement(parent, label, attribs)
+            logger_mjcf.debug(f"Added {label} to {parent_body_name} from json. name: {attribs.get('name')}")
+            add_num += 1
+        return add_num
 
-    def _apply_default(self) -> None:
-        self.default.clear()
-        robot_class = (self.cfg.defaults or {}).get("robot_class", "robot")
-        robot_default = ET.SubElement(self.default, "default", attrib={"class": robot_class})
+    def add_json_site(self) -> int:
+        """
+        添加 json 文件中的 site 配置
+        
+        """
+        json_site = self.json_cfg.sites or []
+        add_num = self.__add_json_list_configs_body(self.worldbody, json_site, "site")
+        logger_mjcf.debug(f"Added site from json: {len(json_site)} sites")
+        return add_num
 
-        visual_default = ET.SubElement(robot_default, "default", attrib={"class": "visual"})
-        ET.SubElement(visual_default, "geom", attrib={"contype": "0", "conaffinity": "0", "group": "2"})
+    def add_json_light(self) -> int:
+        """
+        添加 json 文件中的 light 配置
+        
+        """
+        json_light = self.json_cfg.lights or []
+        add_num = self.__add_json_list_configs_body(self.worldbody, json_light, "light")
+        logger_mjcf.debug(f"Added light from json: {len(json_light)} lights")
+        return add_num
 
-        collision_default = ET.SubElement(robot_default, "default", attrib={"class": "collision"})
-        ET.SubElement(
-            collision_default,
-            "geom",
-            attrib={
-                "condim": "4",
-                "contype": "1",
-                "group": "3",
-                "conaffinity": "1",
-                "priority": "0",
-                "solref": "0.02 1",
-                "solimp": "0.9 0.95 0.001",
-                "friction": "1 0.005 0.0001",
-            },
-        )
+    def add_json_camera(self) -> int:
+        """
+        添加 json 文件中的 camera 配置
+        
+        """
+        json_camera = self.json_cfg.cameras or []
+        add_num = self.__add_json_list_configs_body(self.worldbody, json_camera, "camera")
+        logger_mjcf.debug(f"Added camera from json: {len(json_camera)} cameras")
+        return add_num
 
-        # if self.default.find("./default[@class='floor']") is None:
-        #     fdef = ET.SubElement(self.default, "default", attrib={"class": "floor"})
-        #     ET.SubElement(fdef, "geom", attrib={"type": "plane", "size": "0 0 0.05", "material": "groundplane"})
+    def add_json_texture(self) -> int:
+        """
+        添加 json 文件中的 texture 配置
+        
+        """
+        add_num = 0
+        json_texture = self.json_cfg.textures or []
+        for config in json_texture:
+            parent_body_name = config.get("label")
+            texture_name = config.get("name")
+            texture_file = config.get("file")
+            texture_geom_pos = config.get("pos")
+            texture_geom_quat = config.get("quat")
+            texture_geom_euler = config.get("euler")
+            texture_geom_size = config.get("size")
 
-    def _apply_asset_extras(self) -> None:
-        acfg = self.cfg.asset or {}
-        for tex in acfg.get("textures", []) if isinstance(acfg.get("textures", []), list) else []:
-            if isinstance(tex, dict):
-                ET.SubElement(self.asset, "texture", attrib={k: str(v) for k, v in tex.items()})
-        for mat in acfg.get("materials", []) if isinstance(acfg.get("materials", []), list) else []:
-            if isinstance(mat, dict):
-                ET.SubElement(self.asset, "material", attrib={k: str(v) for k, v in mat.items()})
-        for mesh in acfg.get("meshes", []) if isinstance(acfg.get("meshes", []), list) else []:
-            if isinstance(mesh, dict):
-                ET.SubElement(self.asset, "mesh", attrib={k: str(v) for k, v in mesh.items()})
+            if texture_name is None:
+                logger_mjcf.error(f"The texture 'name' is None when add texture. body name: {parent_body_name}")
+                continue
+            if texture_file is None:
+                logger_mjcf.error(f"The texture 'file' is None when add texture. texture name: {texture_name}")
+                continue
+            if texture_geom_size is None:
+                logger_mjcf.error(f"The texture 'size' is None when add texture. texture name: {texture_name}")
+                continue
+            if texture_geom_pos is None:
+                logger_mjcf.warning(f"The texture 'pos' is None when add texture. texture name: {texture_name}")
+                continue
+            if texture_geom_quat is None and texture_geom_euler is None:
+                logger_mjcf.warning(f"The texture 'quat' and 'euler' is None when add texture. texture name: {texture_name}")
+                continue
+            if texture_geom_quat is not None and texture_geom_euler is not None:
+                logger_mjcf.error(f"The texture has both 'quat' and 'euler' when add texture. texture name: {texture_name}")
+                continue
+            
+            ET.SubElement(self.asset, "texture", attrib={"name": texture_name, "file": texture_file, "type": "2d"})
+            ET.SubElement(self.asset, "material", attrib={"name": texture_name, "texture": texture_name})
+            parent_body = MjcfBuilder.__find_body_by_name(self.worldbody, parent_body_name)
+            texture_body_attribs = {
+                "class": "visual",
+                "name": texture_name,
+                "type": "box",
+                "size": _vec2str(x/2.0 for x in _str2vec(texture_geom_size))+" 1e-5",
+                "material": texture_name,
+            }
+            if texture_geom_pos is not None:
+                texture_body_attribs["pos"] = texture_geom_pos
+            if texture_geom_quat is not None:
+                texture_body_attribs["quat"] = texture_geom_quat
+            elif texture_geom_euler is not None:
+                texture_body_attribs["euler"] = texture_geom_euler
+            MjcfBuilder._add_geom(body=parent_body, attribs=texture_body_attribs)
+            add_num += 1
+            logger_mjcf.debug(f"Added texture to {parent_body_name} from json. texture name: {texture_name}")
+        return add_num
 
-        if self.asset.find("./material[@name='default_material']") is None:
-            ET.SubElement(self.asset, "material", attrib={"name": "default_material", "rgba": "0.7 0.7 0.7 1"})
 
-    def _apply_contact_extras(self) -> None:
-        ccfg = self.cfg.contact or {}
-        excludes = ccfg.get("excludes", [])
-        if isinstance(excludes, list):
-            for ex in excludes:
-                if isinstance(ex, dict) and "body1" in ex and "body2" in ex:
-                    ET.SubElement(self.contact, "exclude", attrib={"body1": str(ex["body1"]), "body2": str(ex["body2"])})
+    def add_json_customize(self) -> int:
+        """
+        添加 json 文件中的 customize 配置
+        
+        """
+        pass
+
+
+    def add_json_worldbody_floor(self) -> int:
+        """
+        添加 json 文件中的 floor 配置
+        
+        """
+        json_floor = self.json_cfg.worldbody.get("floor")
+        if not isinstance(json_floor, dict):
+            logger_mjcf.error(f"The floor config is invalid when add floor.")
+            return 0
+        json_floor_geom_attribs = json_floor.get("geom")
+        json_floor_material_attribs = json_floor.get("material")
+        json_floor_texture_attribs = json_floor.get("texture")
+        if json_floor_geom_attribs is None or not isinstance(json_floor_geom_attribs, dict):
+            logger_mjcf.error(f"The floor 'geom' config is invalid when add floor.")
+            return 0
+        if json_floor_material_attribs is None or not isinstance(json_floor_material_attribs, dict):
+            logger_mjcf.error(f"The floor 'material' config is invalid when add floor.")
+            return 0
+        if json_floor_texture_attribs is None or not isinstance(json_floor_texture_attribs, dict):
+            logger_mjcf.error(f"The floor 'texture' config is invalid when add floor.")
+            return 0
+        ET.SubElement(self.worldbody, "geom", attrib=json_floor_geom_attribs)
+        ET.SubElement(self.asset, "material", attrib=json_floor_material_attribs)
+        ET.SubElement(self.asset, "texture", attrib=json_floor_texture_attribs)
+        logger_mjcf.debug(f"Added floor from json. floor geom name: {json_floor_geom_attribs.get('name')}")
+        return 1
+
+
+    def add_json_worldbody_skybox(self) -> int:
+        """
+        添加 json 文件中的 skybox 配置
+        
+        """
+        json_skybox_texture_attribs = self.json_cfg.worldbody.get("skybox_texture")
+        if not isinstance(json_skybox_texture_attribs, dict):
+            return 0
+        ET.SubElement(self.asset, "texture", attrib=json_skybox_texture_attribs)
+        logger_mjcf.debug(f"Added skybox from json. skybox texture name: {json_skybox_texture_attribs.get('name')}")
+        return 1
+        
+
+    def add_json_worldbody_freejoint(self) -> int:
+        """
+        添加 json 文件中的 freejoint 配置
+        
+        """
+        add_num = 0
+        json_freejoint_bodies = self.json_cfg.worldbody.get("freejoint_body")
+        if not isinstance(json_freejoint_bodies, list):
+            logger_mjcf.error(f"The freejoint config is invalid when add freejoint.")
+            return 0
+        worldbody_bodies = self.worldbody.findall("body")
+        for worldbody_body in worldbody_bodies:
+            if worldbody_body.attrib.get("name") in json_freejoint_bodies:
+                ET.SubElement(worldbody_body, "freejoint")
+                logger_mjcf.debug(f"Added freejoint to {worldbody_body.attrib.get('name')} from json.")
+                add_num += 1
+        return add_num
+
+    def add_urdf_material(self) -> int:
+        """
+        添加 urdf 文件中的 material 信息
+        """
+        add_num = 0
+        for material in self.urdf_model.materials:
+            attraib = {
+                "name": material.m_name or "unkonwn_material",
+                "rgba": material.color_rgba or "1 1 1 1",
+            }
+            ET.SubElement(self.asset, "material", attraib)
+            add_num += 1
+            logger_mjcf.debug(f"Added material from urdf: material name{material}")
+        return add_num
+
+    def add_urdf_contact(self) -> int:
+
+        add_num = 0
+        for joint in self.urdf_model.joints:
+            if joint.j_type not in  ["revolute", "continuous", "prismatic"]:
+                continue
+            p_link_name = joint.parent
+            c_link_name = joint.child
+            attraibs = {"body1": p_link_name, "body2": c_link_name}
+            ET.SubElement(self.contact, "exclude", attrib=attraibs)
+            add_num += 1
+        return add_num
+
+    def add_urdf_actuator_default(self) -> None:
+        """
+        添加 urdf 文件中的 joint 为 actuatir 
+        
+        """
+        pass
+
+    def add_urdf_actuator_mj_actuator(self) -> None:
+        """
+        添加 urdf 文件中的 ros2_control 为 actuatir 
+        
+        """
+        pass
+
+    def add_urdf_equality(self) -> None:
+        """
+        添加 urdf 文件中的 mimic(equality) 配置
+        
+        """
+        add_num = 0
+        for joint in self.urdf_model.joints:
+            if joint.j_type not in  ["revolute", "continuous", "prismatic"]:
+                continue
+            if joint.mimic is None:
+                continue
+            joint_name = joint.j_name
+            mimic_link_name = joint.mimic.joint
+            mimic_multiplier = joint.mimic.multiplier
+            mimic_offset = joint.mimic.offset
+
+            polycoef = [mimic_offset, mimic_multiplier, 0, 0, 0]
+            attraibs = {"joint1": mimic_link_name, "joint2": joint_name, "polycoef": _vec2str(polycoef)}
+            ET.SubElement(self.equality, "joint", attrib=attraibs)
+            add_num += 1
+        return add_num
+
+
+
 
     # -------------------------
     # Primitives
     # 基础节点
     # -------------------------
-    def add_body(self, parent: ET.Element, name: str, pos: str, quat: str) -> ET.Element:
-        logger.info("Created body: name='%s', parent='%s'", name, parent.attrib.get("name", "unknown"))
-        return ET.SubElement(parent, "body", attrib={"name": name, "pos": pos, "quat": quat})
-
-    def ensure_site(self, body: ET.Element, name: str, pos: str = "0 0 0", quat: str = "1 0 0 0") -> ET.Element:
-        """
-        EN: Ensure a site exists under body.
-        CN: 确保 body 下存在指定 site（不存在则创建）。
-        """
-        existing = body.find(f"./site[@name='{name}']")
-        if existing is not None:
-            return existing
-        ret = ET.SubElement(body, "site", attrib={"name": name, "pos": pos, "quat": quat})
-        logger.debug("Created site: name='%s', body='%s'", name, body.attrib.get("name", "unknown"))
-        return ret
-
-    def add_inertial(self, body: ET.Element, inertial: UrdfInertial) -> ET.Element:
-        attrs = {
-            "pos": inertial.pos,
-            "quat": inertial.quat,
-            "mass": str(inertial.mass),
-            "diaginertia": f"{inertial.diaginertia[0]} {inertial.diaginertia[1]} {inertial.diaginertia[2]}",
-        }
-        logger.debug("Created inertial: body='%s'", body.attrib.get("name", "unknown"))
-        return ET.SubElement(body, "inertial", attrib=attrs)
-
-    def add_freejoint(self, body: ET.Element, mj_joint_name: str) -> ET.Element:
-        attrs: Dict[str, str] = {"name": mj_joint_name}
-        logger.debug("Created freejoint: name='%s', body='%s'", mj_joint_name, body.attrib.get("name", "unknown"))
-        return ET.SubElement(body, "freejoint", attrib=attrs)
-    
-    def add_joint(self, body: ET.Element, mj_joint_name: str, mj_type: str, axis: str, range_pair: Optional[Tuple[float, float]]) -> ET.Element:
-        attrs: Dict[str, str] = {"name": mj_joint_name, "type": mj_type, "axis": axis, "ref": "0.0"}
-        if range_pair is not None:
-            attrs["range"] = f"{range_pair[0]} {range_pair[1]}"
-        logger.debug("Created joint: name='%s', type='%s', body='%s'", mj_joint_name, mj_type, body.attrib.get("name", "unknown"))
-        return ET.SubElement(body, "joint", attrib=attrs)
-
-    def add_geom(
-        self,
-        body: ET.Element,
-        class_name: str,
-        name: str,
-        pos: str,
-        quat: str,
-        geom: UrdfGeometry,
-        material: Optional[str] = None,
-        mesh_name: Optional[str] = None,
-    ) -> ET.Element:
-        attrs: Dict[str, str] = {"class": class_name, "name": name, "pos": pos, "quat": quat}
-        if geom.kind == "mesh":
-            attrs["type"] = "mesh"
-            if mesh_name:
-                attrs["mesh"] = mesh_name
-            if geom.scale:
-                attrs["scale"] = geom.scale
-        else:
-            attrs["type"] = geom.kind
-            if geom.size:
-                attrs["size"] = geom.size
-            if geom.scale:
-                attrs["scale"] = geom.scale
-
-        if material and class_name == "visual":
-            attrs["material"] = material
-        logger.debug("Created geom: name='%s', type='%s', body='%s'", name, geom.kind, body.attrib.get("name", "unknown"))
-        return ET.SubElement(body, "geom", attrib=attrs)
-
-    # -------------------------
-    # Materials/assets naming
-    # 材质与资产命名
-    # -------------------------
-    def add_urdf_materials(self, urdf_materials: Dict[str, UrdfMaterial]) -> None:
-        """
-        EN: Add URDF-defined materials into MJCF <asset>.
-        CN: 将 URDF 中定义的 material 写入 MJCF 的 <asset>。
-        """
-        added = 0
-        for name, m in urdf_materials.items():
-            if not name:
-                continue
-            if m.rgba and self.asset.find(f"./material[@name='{name}']") is None:
-                ET.SubElement(self.asset, "material", attrib={"name": name, "rgba": m.rgba})
-                added += 1
-        logger.debug("Added URDF materials into MJCF: %d", added)
-
-    def ensure_mesh_and_material(self, kind_upper: str, mesh_filename: str) -> MeshAssetInfo:
-        """
-        EN: Ensure a <mesh> and a corresponding <material> exist in <asset>.
-        CN: 确保 <asset> 中存在对应的 <mesh> 和 <material>。
-        """
-        key = (kind_upper, mesh_filename)
-        if key in self._mesh_assets:
-            return self._mesh_assets[key]
-
-        self._mesh_kind_counter[kind_upper] += 1
-
-        token = _mesh_token_from_filename(mesh_filename)
-        mesh_name = f"{kind_upper}_{token}_MESH"
-        material_name = f"{kind_upper}_{token}_MATERIAL"
-
-        resolved_path = _resolve_mesh_path_preserve_symlink_semantics(mesh_filename, self.urdf_path, self.mjcf_path, self.cfg.package_map)
-        ET.SubElement(self.asset, "mesh", attrib={"name": mesh_name, "file": resolved_path})
-
-        mat_elem = ET.SubElement(self.asset, "material", attrib={"name": material_name, "rgba": "0.7 0.7 0.7 1"})
-        info = MeshAssetInfo(mesh_name=mesh_name, material_name=material_name, material_elem=mat_elem)
-        self._mesh_assets[key] = info
-
-        logger.debug("Registered mesh asset: kind=%s, mesh='%s', file='%s'", kind_upper, mesh_name, resolved_path)
-        return info
-
-    # -------------------------
-    # World decorations
-    # 世界装饰（地面/天空盒/灯光/freejoint）
-    # -------------------------
-    def add_world_decorations(self) -> None:
-        wcfg = self.cfg.worldbody or {}
-        if bool(wcfg.get("add_default_floor", True)):
-            self._add_floor()
-        if bool(wcfg.get("add_default_skybox", True)):
-            self._add_skybox()
-        if bool(wcfg.get("add_default_light", True)):
-            self._add_light()
-
-    def add_freejoint_to_root(self, root_body: ET.Element) -> None:
-        wcfg = self.cfg.worldbody or {}
-        if bool(wcfg.get("add_freejoint", True)):
-            ET.SubElement(root_body, "freejoint", attrib={"name": f"{root_body.attrib.get('name','root')}_free"})
-
-    def _add_floor(self) -> None:
-        if self.asset.find("./texture[@name='groundplane']") is None:
-            ET.SubElement(
-                self.asset,
-                "texture",
-                attrib={
-                    "type": "2d",
-                    "name": "groundplane",
-                    "builtin": "checker",
-                    "mark": "edge",
-                    "rgb1": "0.2 0.3 0.4",
-                    "rgb2": "0.1 0.2 0.3",
-                    "markrgb": "0.8 0.8 0.8",
-                    "width": "300",
-                    "height": "300",
-                },
-            )
-        if self.asset.find("./material[@name='groundplane']") is None:
-            ET.SubElement(
-                self.asset,
-                "material",
-                attrib={
-                    "name": "groundplane",
-                    "texture": "groundplane",
-                    "texuniform": "true",
-                    "texrepeat": "5 5",
-                    "reflectance": "0.2",
-                },
-            )
-        if self.worldbody.find("./geom[@name='floor']") is None:
-            ET.SubElement(self.worldbody, "geom", attrib={"name": "floor", "type": "plane", "size": "0 0 0.05", "material": "groundplane"})
-
-    def _add_skybox(self) -> None:
-        if self.asset.find("./texture[@name='skybox']") is None:
-            ET.SubElement(
-                self.asset,
-                "texture",
-                attrib={
-                    "name": "skybox",
-                    "type": "skybox",
-                    "builtin": "gradient",
-                    "rgb1": ".3 .5 .7",
-                    "rgb2": "0 0 0",
-                    "width": "1024",
-                    "height": "1024",
-                },
-            )
-        g = self.visual.find("global")
-        if g is None:
-            g = ET.SubElement(self.visual, "global")
-        g.attrib.setdefault("offwidth", "640")
-        g.attrib.setdefault("offheight", "480")
-
-    def _add_light(self) -> None:
-        if self.worldbody.find("./light[@name='default_light']") is None:
-            ET.SubElement(
-                self.worldbody,
-                "light",
-                attrib={
-                    "name": "default_light",
-                    "pos": "0 0 10",
-                    "dir": "0 0 -1",
-                    "directional": "true",
-                },
-            )
-
-    # -------------------------
-    # Contact / Equality
-    # 接触排除 / Mimic 约束
-    # -------------------------
-    def add_contact_excludes_from_tree(self, model: UrdfModel) -> None:
-        for j in model.joints.values():
-            lp = model.links.get(j.parent)
-            lc = model.links.get(j.child)
-            if lp and lc and lp.collisions and lc.collisions:
-                ET.SubElement(self.contact, "exclude", attrib={"body1": j.parent, "body2": j.child})
-
-    def add_mimic_equalities(self, model: UrdfModel) -> None:
-        for j in model.joints.values():
-            if j.mimic_joint:
-                polycoef = f"{j.mimic_offset} {j.mimic_multiplier} 0 0 0"
-                ET.SubElement(
-                    self.equality,
-                    "joint",
-                    attrib={
-                        "joint1": j.mimic_joint,
-                        "joint2": j.name,
-                        "polycoef": polycoef,
-                        "solimp": str((self.cfg.equality or {}).get("solimp", "0.95 0.99 0.001")),
-                        "solref": str((self.cfg.equality or {}).get("solref", "0.005 1")),
-                    },
-                )
-
-    # =============================================================================
-    # Actuator / Sensor / Camera logic
-    # 执行器 / 传感器 / 相机逻辑
-    # =============================================================================
-    @staticmethod
-    def _ros2_ci_to_actuator_tag(ci: str) -> str:
-        """EN: Map ros2_control command_interface to MJCF actuator tag. CN: 接口名到 actuator 标签映射。"""
-        c = ci.strip().lower()
-        if c.startswith("position"):
-            return "position"
-        if c.startswith("velocity"):
-            return "velocity"
-        if c.startswith("effort") or c.startswith("motor"):
-            return "motor"
-        return c
 
     @staticmethod
-    def _infer_sensor_tags_from_state_ifaces(state_ifaces: List[str]) -> List[str]:
-        """EN: Infer sensor tags from state interfaces. CN: 从 state_interface 推断传感器类型。"""
-        s = [x.strip().lower() for x in state_ifaces]
-        tags: List[str] = []
-        if any(x.startswith("force.") or x == "force" for x in s):
-            tags.append("force")
-        if any(x.startswith("torque.") or x == "torque" for x in s):
-            tags.append("torque")
-        if any("framequat" in x or x.endswith("quat") or "orientation" in x for x in s):
-            tags.append("framequat")
-        if any("gyro" in x or "angular_velocity" in x or "angvel" in x for x in s):
-            tags.append("gyro")
-        if any("accelerometer" in x or "accel" in x or "linear_acceleration" in x for x in s):
-            tags.append("accelerometer")
-        return tags
-
-    def add_actuators_urdf(self, model: UrdfModel) -> bool:
+    def _add_body(parent: ET.Element[str], attribs: Dict[str, Any]) -> Optional[ET.Element[str]]:
         """
-        EN: Add actuators derived from ros2_control MujocoSystem.
-        CN: 从 URDF 的 ros2_control MujocoSystem 生成 actuator。
-        """
-        added_any = False
-        if model.ros2_control.present and model.ros2_control.joints:
-            for jn, rj in model.ros2_control.joints.items():
-                for ci in rj.command_interfaces:
-                    tag = self._ros2_ci_to_actuator_tag(ci)
-                    attrs: Dict[str, str] = {"joint": jn}
-                    attrs["name"] = f"{jn}_{tag.upper()}"
-
-                    if ci.strip().lower() != tag:
-                        attrs["interface"] = ci
-
-                    for pk, pv in (rj.params or {}).items():
-                        attrs[pk] = str(pv)
-
-                    ET.SubElement(self.actuator, tag, attrib=attrs)
-                    logger.info("Added actuator (URDF): tag='%s', name='%s', joint='%s'", tag, attrs["name"], jn)
-                    added_any = True
-        return added_any
-
-    def add_actuators_from_json(self, mj_joint_names: List[str]) -> bool:
-        """
-        EN: Add actuators from JSON (flattened list in cfg.actuators).
-        CN: 从 JSON 添加执行器（cfg.actuators 为扁平列表）。
-        """
-        added_any = False
-        for a in self.cfg.actuators:
-            if a.get("joint") not in mj_joint_names:
-                logger.warning(
-                    "Actuator skipped (joint not found): name='%s', joint='%s'",
-                    a.get("name", "unnamed"),
-                    a.get("joint", "unknown"),
-                )
-                continue
-            act_type = str(a.get("type", "motor"))
-            attrs = {k: str(v) for k, v in a.items() if k not in ("type",)}
-            ET.SubElement(self.actuator, act_type, attrib=attrs)
-            logger.info("Added actuator (JSON): type='%s', name='%s', joint='%s'", act_type, a.get("name"), a.get("joint"))
-            added_any = True
-        return added_any
-
-    def add_actuators_default(self, model: UrdfModel, mj_joint_names: List[str]) -> bool:
-        """
-        EN: Add default actuators for non-mimic joints.
-        CN: 为非 mimic 关节添加默认执行器。
-        """
-        added_any = False
-        for jn in mj_joint_names:
-            uj = model.joints.get(jn)
-            if uj is None:
-                logger.warning("Default actuator skipped (joint missing): joint='%s'", jn)
-                continue
-            if uj.mimic_joint:
-                logger.debug("Default actuator skipped (mimic joint): joint='%s'", jn)
-                continue
-            ET.SubElement(self.actuator, "motor", attrib={"name": f"{jn}_MOTOR", "joint": jn})
-            logger.info("Added actuator (default): type='motor', joint='%s'", jn)
-            added_any = True
-        return added_any
-
-    def add_sensors_from_urdf(self, model: UrdfModel, body_map: Dict[str, ET.Element]) -> bool:
-        """
-        EN: Add sensors derived from ros2_control MujocoSystem sensors.
-        CN: 从 URDF 的 ros2_control MujocoSystem 生成传感器。
-        """
-        added_any = False
-        if model.ros2_control.present and model.ros2_control.sensors:
-            for sn, rs in model.ros2_control.sensors.items():
-                frame_id = (rs.params or {}).get("frame_id", "")
-                target_body = body_map.get(frame_id)
-                if target_body is None:
-                    logger.warning("Sensor skipped (body not found): sensor='%s', frame_id='%s'", sn, frame_id)
-                    continue
-
-                site_name = f"{sn}_SITE"
-                self.ensure_site(target_body, site_name)
-
-                tags = self._infer_sensor_tags_from_state_ifaces(rs.state_interfaces)
-                for t in tags:
-                    nm = f"{sn}_{t}"
-                    ET.SubElement(self.sensor, t, attrib={"name": nm, "site": site_name})
-                    logger.info("Added sensor (URDF): type='%s', name='%s', body='%s'", t, nm, frame_id)
-                    added_any = True
-        return added_any
-
-    def add_sensors_from_json(self, body_map: Dict[str, ET.Element]) -> bool:
-        """
-        EN:
-        JSON sensors are flattened into cfg.sensors with a "type" key.
-        Rule:
-        - Use "body" to locate where to create/ensure the site.
-        - Write sensor XML with all attributes except "body" and "type".
-        - Ensure "site" attribute exists.
-
-        CN:
-        JSON sensor 已扁平化到 cfg.sensors（包含 type 字段）。
-        规则：
-        - 用 body 定位挂载位置并创建/确保 site
-        - 写入除 body/type 外的所有属性
-        - 必须有 site 属性
-        """
-        added_any = False
-        for sens in self.cfg.sensors:
-            tag = str(sens.get("type", "force"))
-            body_name = str(sens.get("body", ""))
-            site_name = f"{body_name}_SITE"
-
-            target_body = body_map.get(body_name)
-            if target_body is None:
-                logger.warning("Sensor skipped (body not found): name='%s', body='%s'", sens.get("name", "unnamed"), body_name)
-                continue
-
-            self.ensure_site(target_body, site_name)
-
-            attrs = {k: str(v) for k, v in sens.items() if k not in ("body", "type")}
-            attrs.setdefault("site", site_name)
-            ET.SubElement(self.sensor, tag, attrib=attrs)
-            logger.info("Added sensor (JSON): type='%s', name='%s', body='%s'", tag, sens.get("name", "unnamed"), body_name)
-            added_any = True
-        return added_any
-
-    def add_cameras_from_json(self, body_map: Dict[str, ET.Element]) -> bool:
-        """
-        EN: Add cameras from JSON. Each camera has a 'body' field indicating parent body.
-        CN: 从 JSON 添加相机，每个 camera 的 'body' 指示其父 body。
-        """
-        if not self.cfg.cameras:
-            return False
-
-        camera_dict: Dict[str, List[Dict[str, Any]]] = {}
-        for cam in self.cfg.cameras:
-            body_name = cam.get("body")
-            if not body_name:
-                continue
-            camera_dict.setdefault(str(body_name), [])
-            cam_attrs = {k: v for k, v in cam.items() if k != "body"}
-            camera_dict[str(body_name)].append(cam_attrs)
-
-        added_any = False
-        for body_name, cam_specs in camera_dict.items():
-            parent = body_map.get(str(body_name))
-            if parent is None:
-                logger.warning("Camera parent body not found: '%s'", body_name)
-
-            for cam_spec in cam_specs:
-                ET.SubElement(parent, "camera", attrib={k: str(v) for k, v in cam_spec.items()})
-                logger.info("Added camera (JSON): name='%s', body='%s'", cam_spec.get("name", "unnamed"), body_name)
-                added_any = True
-
-        return added_any
-
-    def add_textures_from_json(self, body_map: Dict[str, ET.Element]) -> bool:
-        """
-        EN: Add textures from JSON. Each texture has a 'body' field indicating parent body.
-        CN: 从 JSON 添加纹理，每个 texture 的 'body' 指示其父 body。
-        """
-        if not self.cfg.textures:
-            return False
+        添加 body 节点
         
-        camera_dict: Dict[str, List[Dict[str, Any]]] = {}
-        for tex in self.cfg.textures:
-            body_name = tex.get("body")
-            if not body_name:
-                continue
-            camera_dict.setdefault(str(body_name), [])
-            tex_attrs = {k: v for k, v in tex.items() if k != "body"}
-            camera_dict[str(body_name)].append(tex_attrs)
-
-        added_any = False
-        for body_name, tex_specs in camera_dict.items():
-            parent = body_map.get(str(body_name))
-            if parent is None:
-                logger.warning("Texture parent body not found: '%s'", body_name)
-
-            for tex_spec in tex_specs:
-                texture_name = tex_spec.get("name", "")
-                texture_file = tex_spec.get("file", "")
-
-                if texture_name and texture_file and body_name in body_map:
-                    # Add texture to asset
-                    ET.SubElement(self.asset, "texture", {
-                        "name": texture_name,
-                        "type": "2d",
-                        "file": texture_file
-                    })
-                    
-                    # Add material to asset
-                    material_name = texture_name
-                    ET.SubElement(self.asset, "material", {
-                        "name": material_name,
-                        "texture": texture_name
-                    })
-                    
-                    # Get position and size from config
-                    pos = tex_spec.get("pos", "0 0 0")
-                    euler = tex_spec.get("euler", "0 0 0")
-                    size_config = tex_spec.get("size", "0.05 0.05")
-                    
-                    # Parse size and convert to box dimensions
-                    try:
-                        size_vals = [float(x) for x in size_config.split()]
-                        if len(size_vals) >= 2:
-                            # First two values are halved, last value is fixed to 1e-5
-                            box_size = f"{size_vals[0]/2.0} {size_vals[1]/2.0} 1e-5"
-                        else:
-                            box_size = "0.025 0.025 1e-5"
-                    except:
-                        box_size = "0.025 0.025 1e-5"
-                    
-                    # Add geom to the corresponding body
-                    target_body = body_map[body_name]
-                    geom_name = f"{body_name}_TEXTURE"
-                    ET.SubElement(target_body, "geom", {
-                        "class": "visual",
-                        "name": geom_name,
-                        "pos": pos,
-                        "euler": euler,
-                        "type": "box",
-                        "size": box_size,
-                        "material": material_name
-                    })
-
-                    logger.info("Added texture (JSON): name='%s', body='%s'", texture_name, body_name)
-                    added_any = True
-
-        return added_any
-
-    def add_contact_from_json(self) -> bool:
+        :param parent: 父节点
+        :param attribs: 属性
+        :return: 添加的节点
         """
-        EN: Add contact exclusions from JSON configuration.
-        CN: 从 JSON 配置添加接触排除规则。
+        # 检查名称
+        if "name" in attribs:
+            if attribs["name"] == "world":
+                logger_mjcf.warning("The name of body is 'world', which is reserved. It will be deleted")
+            exist_bodys = parent.findall("body")
+            if any(body.attrib.get("name") == attribs["name"] for body in exist_bodys):
+                logger_mjcf.warning("Body name '%s' already exists in '%s', Ignoring...", attribs["name"], parent.attrib.get("name", "unknown"))
+                return None
+        elem_attribs = {}
+        # 按照指定顺序添加关键属性
+        for k in ["name", "pos", "quat", "euler"]:
+            if k in attribs:
+                elem_attribs[k] = str(attribs[k])
+        # 添加其余属性
+        for k, v in attribs.items():
+            if k not in ["name", "pos", "quat", "euler"]:
+                elem_attribs[k] = str(v)
+        sub_elem = ET.SubElement(parent, "body", attrib=elem_attribs)
+        logger_mjcf.debug("Created body: name='%s', parent='%s'", attribs.get("name", "unknown"), parent.attrib.get("name", "unknown"))
+        return sub_elem
+    
+    @staticmethod
+    def _add_inertial(body: ET.Element[str], attribs: Dict[str, Any]) ->  Optional[ET.Element[str]]:
         """
-        contact_config = self.cfg.config.get("contact", {})
-        if not contact_config:
-            return False
+        添加 inertial 节点
+        
+        :param body: 父节点
+        :param attribs: 节点属性
+        :return: 添加的节点
+        """
+        # 检查
+        if any(body.findall("inertial")):
+            logger_mjcf.warning("Inertial already exists in '%s', Ignoring...", body.attrib.get("name", "unknown"))
+            return None
+        elem_attribs = {}
+        # 按照指定顺序添加关键属性
+        for k in ["mass", "diaginertia", "pos", "quat", "euler"]:
+            if k in attribs:
+                elem_attribs[k] = str(attribs[k])
+        # 添加其余属性
+        for k, v in attribs.items():
+            if k not in ["mass", "diaginertia", "pos", "quat", "euler"]:
+                elem_attribs[k] = str(v)
+        logger_mjcf.debug("Created inertial: body='%s'", body.attrib.get("name", "unknown"))
+        sub_elem = ET.SubElement(body, "inertial", attrib=elem_attribs)
+        return sub_elem
+    
+    @staticmethod
+    def _add_joint(body: ET.Element[str], attribs: Dict[str, Any]) ->  Optional[ET.Element[str]]:
+        """
+        添加 joint 节点
+        
+        :param body: 父节点
+        :param attribs: 节点属性
+        :return: 添加的节点
+        """
+        # 检查
+        if "name" in attribs:
+            exist_joints = body.findall("joint")
+            if any(joint.attrib.get("name") == attribs["name"] for joint in exist_joints):
+                logger_mjcf.warning("Joint name '%s' already exists in '%s', Ignoring...", attribs["name"], body.attrib.get("name", "unknown"))
+                return None
+        elem_attribs = {}
+        # 按照指定顺序添加关键属性
+        for k in ["name", "type", "pos", "axis", "ref", "range"]:
+            if k in attribs:
+                elem_attribs[k] = str(attribs[k])
+        # 添加其余属性
+        for k, v in attribs.items():
+            if k not in ["name", "type", "axis", "ref", "range"]:
+                elem_attribs[k] = str(v)
+        logger_mjcf.debug("Created joint: name='%s', parent='%s'", attribs.get("name", "unknown"), body.attrib.get("name", "unknown"))
+        sub_elem = ET.SubElement(body, "joint", attrib=elem_attribs)
+        return sub_elem
 
-        excludes = contact_config.get("exclude", [])
-        if not isinstance(excludes, list):
-            return False
+    @staticmethod
+    def _add_geom(body: ET.Element[str], attribs: Dict[str, Any]) ->  Optional[ET.Element[str]]:
+        """
+        添加 geom 节点
+        
+        :param body: 父节点
+        :param attribs: 节点属性
+        :return: 添加的节点
+        """
+        # 检查
+        if "name" in attribs:
+            exist_geoms = body.findall("geom")
+            if any(geom.attrib.get("name") == attribs["name"] for geom in exist_geoms):
+                logger_mjcf.warning("Geom name '%s' already exists in '%s', Ignoring...", attribs["name"], body.attrib.get("name", "unknown"))
+                return None
+        elem_attribs = {}
+        # 按照指定顺序添加关键属性
+        for k in ["class", "name", "type", "mesh", "material", "rgba", "pos", "quat", "euler"]:
+            if k in attribs:
+                elem_attribs[k] = str(attribs[k])
+        # 添加其余属性
+        for k, v in attribs.items():
+            if k not in ["class", "name", "type", "mesh", "material", "rgba", "pos", "quat", "euler"]:
+                elem_attribs[k] = str(v)
+        logger_mjcf.debug("Created geom: name='%s', body='%s'", attribs.get("name", "unknown"), body.attrib.get("name", "unknown"))
+        sub_elem = ET.SubElement(body, "geom", attrib=elem_attribs)
+        return sub_elem
+    
+    @staticmethod
+    def _add_mesh(asset: ET.Element[str], attribs: Dict[str, Any]) ->  Optional[ET.Element[str]]:
+        """
+        添加mesh
 
-        added_any = False
-        for exclude_info in excludes:
-            if not isinstance(exclude_info, dict):
-                continue
+        :param asset: 父 asset 元素
+        :param attribs: 属性
+        :return: 添加的 mesh 元素
+        """
+        # 检查mesh
+        if "name" in attribs:
+            exist_meshes = asset.findall("mesh")
+            if any(mesh.attrib.get("name") == attribs["name"] for mesh in exist_meshes):
+                logger_mjcf.warning("Mesh with name '%s' already exists, Ignoring...", attribs["name"])
+                return None
+        elem_attribs = {}
+        # 按照指定顺序添加关键属性
+        for k in ["name", "file", "scale", "material"]:
+            if k in attribs:
+                elem_attribs[k] = str(attribs[k])
+        # 添加其他属性
+        for k, v in attribs.items():
+            if k not in ["name", "file", "scale", "material"]:
+                elem_attribs[k] = str(v)
+        logger_mjcf.debug("Created mesh: name=%s, file=%s", attribs.get("name", "unknown"), attribs.get("file", "unknown"))
+        sub_elem = ET.SubElement(asset, "mesh", attrib=elem_attribs)
+        return sub_elem
+        
 
-            body1 = exclude_info.get("body1")
-            body2 = exclude_info.get("body2")
+    @staticmethod
+    def _build_body(parent: ET.Element[str], link: UrdfParser.UrdfLink, joint:Optional[UrdfParser.UrdfJoint],  asset:ET.Element[str]) -> Optional[ET.Element[str]]:
+        """
+        构建 body 节点
+        
+        :param parent: 父节点
+        :param link: 要构建的 body 在 urdf 中的 link
+        :param joint: 以 link 为子节点的 joint
+        :param asset: 资源节点，用于添加 mesh
+        :return: 添加的 body 节点
+        """
+        # 构建 body
+        body_attribs = {
+            "name": link.l_name,
+            "pos": joint.origin.xyz if joint is not None else "0 0 0",
+            "quat": _vec2str(_rpy_to_quaternion(_str2vec(joint.origin.rpy))) if joint is not None else "0 0 0",
+        }
+        body = MjcfBuilder._add_body(parent, body_attribs)
+        if body is None:
+            return None
 
-            if body1 and body2:
-                ET.SubElement(self.contact, "exclude", attrib={
-                    "body1": str(body1),
-                    "body2": str(body2)
-                })
-                logger.info("Added contact exclusion: body1='%s', body2='%s'", body1, body2)
-                added_any = True
-
-        return added_any
-
-# =============================================================================
-# Build worldbody recursively (no auto site creation)
-# 从 URDF 构建 worldbody（默认不创建 site）
-# =============================================================================
-def _build_worldbody_from_urdf(builder: MjcfBuilder, model: UrdfModel) -> Tuple[ET.Element, Dict[str, ET.Element], List[str]]:
-    """
-    EN:
-    Returns:
-      - root_body (ET.Element)
-      - body_map: link_name -> body element
-      - mj_joint_names: URDF joint names created in MJCF
-
-    CN:
-    返回：
-      - root_body（根 body）
-      - body_map：link_name -> body 元素
-      - mj_joint_names：在 MJCF 中创建的关节名列表
-    """
-    body_map: Dict[str, ET.Element] = {}
-    mj_joint_names: List[str] = []
-
-    def rec_build(link_name: str, parent_elem: ET.Element) -> ET.Element:
-        if link_name == model.root_link:
-            pos = "0 0 0"
-            quat = "1 0 0 0"
-        else:
-            jname = model.child_to_joint.get(link_name)
-            if jname:
-                j = model.joints[jname]
-                pos = j.origin_pos
-                quat = j.origin_quat
+        # 构建 inertial
+        if link.inertial is not None:
+            inertial_quat = _rpy_to_quaternion(_str2vec(link.inertial.origin.rpy))
+            if abs(link.inertial.inertia.ixy) > 1e-12 or abs(link.inertial.inertia.ixz) > 1e-12 or abs(link.inertial.inertia.iyz) > 1e-12:
+                diaginertia, new_quat = _diagonalize_inertia(
+                    ixx=link.inertial.inertia.ixx,
+                    ixy=link.inertial.inertia.ixy,
+                    ixz=link.inertial.inertia.ixz,
+                    iyy=link.inertial.inertia.iyy, 
+                    iyz=link.inertial.inertia.iyz,
+                    izz=link.inertial.inertia.izz,
+                    qw=inertial_quat[0],
+                    qx=inertial_quat[1],
+                    qy=inertial_quat[2],
+                    qz=inertial_quat[3]
+                )
             else:
-                pos = "0 0 0"
-                quat = "1 0 0 0"
+                diaginertia = (link.inertial.inertia.ixx, link.inertial.inertia.iyy, link.inertial.inertia.izz)
+                new_quat = inertial_quat
+            inertial_attribs = {
+                "mass": link.inertial.mass,
+                "pos": link.inertial.origin.xyz,
+                "quat": _vec2str(new_quat),
+                "diaginertia": _vec2str(diaginertia),
+            }
+            MjcfBuilder._add_inertial(body, inertial_attribs)
 
-        body = builder.add_body(parent_elem, name=link_name, pos=pos, quat=quat)
-        body_map[link_name] = body
+        # 构建 joint
+        if joint is not None:
+            if joint.j_type in ["revolute", "continuous", "prismatic"]:
+                joint_attribs = {
+                    "name": joint.j_name,
+                    "axis": joint.axis,
+                    # "pos": "0 0 0", #joint.origin.xyz,
+                    "ref": ""
+                }
+                if joint.limit is not None:
+                    joint_attribs["range"] = _vec2str([joint.limit.lower, joint.limit.upper])
+                if joint.j_type == "revolute":
+                    joint_attribs["type"] = "hinge"
+                elif joint.j_type == "continuous":
+                    joint_attribs["type"] = "hinge"
+                elif joint.j_type == "prismatic":
+                    joint_attribs["type"] = "slide"
+                MjcfBuilder._add_joint(body, joint_attribs)
 
-        link = model.links.get(link_name)
+        # 构建 collision geom
+        if link.collisions is not None:
+            geom_index = 0
+            for collision in link.collisions:
+                collision_geom_attribs = {
+                    "class": "collision",
+                    "name": "COLLISION_" + link.l_name + "_" + str(geom_index),
+                    "type": collision.geometry.g_type,
+                    "pos": collision.origin.xyz,
+                    "quat": _vec2str(_rpy_to_quaternion(_str2vec(collision.origin.rpy))),
+                }
+                if collision.material is not None:
+                    if collision.material.color_rgba is not None:
+                        collision_geom_attribs["rgba"] = collision.material.color_rgba
+                    elif collision.material.m_name is not None:
+                        collision_geom_attribs["material"] = collision.material.m_name
+                if collision.geometry.g_type == "mesh":
+                    mesh_name = "MESH_" + collision.geometry.filename.split("/")[-1].split(".")[0] # 文件名不带扩展名
+                    MjcfBuilder._add_mesh(asset=asset, attribs={"name": mesh_name, "file": collision.geometry.filename})
+                    collision_geom_attribs["mesh"] = mesh_name
+                elif collision.geometry.g_type == "box":
+                    collision_geom_attribs["size"] = _vec2str(x/2.0 for x in _str2vec(collision.geometry.size))
+                elif collision.geometry.g_type == "sphere":
+                    collision_geom_attribs["size"] = collision.geometry.radius
+                elif collision.geometry.g_type == "cylinder":
+                    collision_geom_attribs["size"] = collision.geometry.radius + " " + str(float(collision.geometry.length)/2)
+                MjcfBuilder._add_geom(body=body, attribs=collision_geom_attribs)
+                geom_index += 1
 
-        # inertial
-        if link and link.inertial is not None:
-            builder.add_inertial(body, link.inertial)
-
-        # joint (non-root)
-        if link_name != model.root_link:
-            jname = model.child_to_joint.get(link_name)
-            if jname:
-                uj = model.joints[jname]
-                if uj.jtype in ("revolute", "continuous", "prismatic"):
-                    mj_type = "hinge" if uj.jtype in ("revolute", "continuous") else "slide"
-                    r = None
-                    if uj.limit_lower is not None and uj.limit_upper is not None:
-                        r = (float(uj.limit_lower), float(uj.limit_upper))
-                    builder.add_joint(body, mj_joint_name=uj.name, mj_type=mj_type, axis=uj.axis, range_pair=r)
-                    mj_joint_names.append(uj.name)
-                elif uj.jtype == "floating":
-                    mj_type = "free"
-                    builder.add_freejoint(body, mj_joint_name=uj.name)
-                    mj_joint_names.append(uj.name)
-
-        # geoms
-        if link:
-            for vg in link.visuals:
-                if vg.geometry.kind == "mesh" and vg.geometry.mesh_filename:
-                    info = builder.ensure_mesh_and_material("VISUAL", vg.geometry.mesh_filename)
-                    if vg.material_name and vg.material_name in model.materials and model.materials[vg.material_name].rgba:
-                        info.material_elem.attrib["rgba"] = model.materials[vg.material_name].rgba
-                    builder.add_geom(body, "visual", vg.name, vg.origin_pos, vg.origin_quat, vg.geometry, material=info.material_name, mesh_name=info.mesh_name)
-                else:
-                    mat = vg.material_name if (vg.material_name and vg.material_name in model.materials and model.materials[vg.material_name].rgba) else "default_material"
-                    builder.add_geom(body, "visual", vg.name, vg.origin_pos, vg.origin_quat, vg.geometry, material=mat, mesh_name=None)
-
-            for cg in link.collisions:
-                if cg.geometry.kind == "mesh" and cg.geometry.mesh_filename:
-                    info = builder.ensure_mesh_and_material("COLLISION", cg.geometry.mesh_filename)
-                    builder.add_geom(body, "collision", cg.name, cg.origin_pos, cg.origin_quat, cg.geometry, material=None, mesh_name=info.mesh_name)
-                else:
-                    builder.add_geom(body, "collision", cg.name, cg.origin_pos, cg.origin_quat, cg.geometry, material=None, mesh_name=None)
-
-        for child in model.parent_map.get(link_name, []):
-            rec_build(child, body)
-
+        # 构建 visual geom
+        if link.visuals is not None:
+            geom_index = 0
+            for visual in link.visuals:
+                visual_geom_attribs = {
+                    "class": "visual",
+                    "name": "VISUAL_" + link.l_name + "_" + str(geom_index),
+                    "type": visual.geometry.g_type,
+                    "pos": visual.origin.xyz,
+                    "quat": _vec2str(_rpy_to_quaternion(_str2vec(visual.origin.rpy))),
+                }
+                if visual.material is not None:
+                    if visual.material.color_rgba is not None:
+                        visual_geom_attribs["rgba"] = visual.material.color_rgba
+                    elif visual.material.m_name is not None:
+                        visual_geom_attribs["material"] = visual.material.m_name
+                if visual.geometry.g_type == "mesh":
+                    mesh_name = "MESH_" + visual.geometry.filename.split("/")[-1].split(".")[0] # 文件名不带扩展名
+                    MjcfBuilder._add_mesh(asset=asset, attribs={"name": mesh_name, "file": visual.geometry.filename})
+                    visual_geom_attribs["mesh"] = mesh_name
+                elif visual.geometry.g_type == "box":
+                    visual_geom_attribs["size"] = _vec2str(x/2.0 for x in _str2vec(visual.geometry.size))
+                elif visual.geometry.g_type == "sphere":
+                    visual_geom_attribs["size"] = visual.geometry.radius
+                elif visual.geometry.g_type == "cylinder":
+                    visual_geom_attribs["size"] = visual.geometry.radius + " " + str(float(visual.geometry.length)/2)
+                MjcfBuilder._add_geom(body=body, attribs=visual_geom_attribs)
+                geom_index += 1
         return body
 
-    # Build all root links as separate bodies under worldbody
-    all_links = set(model.links.keys())
-    child_links = set(model.child_to_joint.keys())
-    roots = list(all_links - child_links)
-    root_body = None
-    for root in roots:
-        rb = rec_build(root, builder.worldbody)
-        if root_body is None:
-            root_body = rb
-    
-    # Check if there is a body named "world" in worldbody and move its contents to worldbody
-    world_body = None
-    for body in builder.worldbody.findall("body"):
-        if body.attrib.get("name") == "world":
-            world_body = body
-            break
-    
-    if world_body is not None:
-        # Move all children of the "world" body to the worldbody
-        for child in list(world_body):
-            builder.worldbody.append(child)
+
+    def build_worldbody_from_urdf(self) -> ET.Element[str]:
+        """
+        Builds the worldbody from the URDF model
+        """
+        root_name = self.urdf_model.root_link
+        # get the UrdfLink named child_name
+        urdf_link = list(filter(lambda link: link.l_name == root_name, self.urdf_model.links))[0]
+        # get the UrdfJoints which are parented to child_name
+        urdf_joint = list(filter(lambda joint: joint.child == root_name, self.urdf_model.joints))
+        if len(urdf_joint) > 0:
+            urdf_joint = urdf_joint[0]
+        else:
+            urdf_joint = None
+        # build the root body to worldbody
+        root_body: ET.Element[str] = MjcfBuilder._build_body(self.worldbody, urdf_link, urdf_joint, asset=self.asset)
         
-        # Remove the "world" body from worldbody
-        builder.worldbody.remove(world_body)
-    
-    logger.info("Built worldbody: bodies=%d, mj_joints=%d", len(body_map), len(mj_joint_names))
-    return root_body, body_map, mj_joint_names
+        def rec_build_bodies(parent_elem: ET.Element[str],):
+            """
+            Recursively build the mjcf bodies
+            """
+            parent_name = parent_elem.attrib["name"]
+            if parent_name in self.urdf_model.parent_map:
+                for child_name in self.urdf_model.parent_map[parent_name]:
+                    # get the UrdfLink named child_name
+                    urdf_link = list(filter(lambda link: link.l_name == child_name, self.urdf_model.links))[0]
+                    # get the UrdfJoints which are parented to child_name
+                    urdf_joint = list(filter(lambda joint: joint.child == child_name, self.urdf_model.joints))
+                    if len(urdf_joint) > 0:
+                        urdf_joint = urdf_joint[0]
+                    else:
+                        urdf_joint = None
+
+                    body = MjcfBuilder._build_body(parent_elem, urdf_link, urdf_joint, asset=self.asset)
+
+                    rec_build_bodies(body)
+
+        # recursively build bodies
+        rec_build_bodies(root_body)
+
+        # delete root body which is named "world"
+        if root_body.attrib.get('name') == "world":
+            logger_mjcf.warning("Root body name is 'world', deleting it...")
+            sub_elems = root_body.findall('body')
+            self.worldbody.remove(root_body)
+            logger_mjcf.warning("Root body name is 'world', deleting it... Done")
+            for sub_elem in sub_elems:
+                self.worldbody.append(sub_elem)
+            logger_mjcf.warning(f"'worldbody' now contains {len(sub_elems)} sub-elements")
+
+        return root_body
+
+    def save_mjcf(self, filename):
+        """
+        Save the MJCF model to a file.
+
+        Parameters
+        filename : str
+            The path to the file.
+        """
+        ET.ElementTree(self.root).write(filename, pretty_print=True)
 
 
 # =============================================================================
@@ -1695,7 +1281,7 @@ def _build_worldbody_from_urdf(builder: MjcfBuilder, model: UrdfModel) -> Tuple[
 # 对外接口
 # =============================================================================
 def mjcf_generator(
-    urdf_path: Union[str, Path],
+    urdf_model: UrdfParser,
     mjcf_path: Union[str, Path],
     json_config_path: Optional[Union[str, Path]] = None,
 ) -> None:
@@ -1703,77 +1289,94 @@ def mjcf_generator(
     EN: Convert URDF to MJCF.
     CN: 将 URDF 转换为 MJCF。
     """
-    urdf_path = Path(urdf_path)
+
     mjcf_path = Path(mjcf_path)
 
-    logger.info("MJCF generation started: urdf='%s', mjcf='%s'", str(urdf_path), str(mjcf_path))
+    logger.info("MJCF generation started: output_mjcf='%s'", str(mjcf_path))
     cfg = MjcfConfig.load(json_config_path)
-    model = UrdfParser(urdf_path, cfg).parse()
+    model = urdf_model
 
-    builder = MjcfBuilder(model_name=model.robot_name, cfg=cfg, urdf_path=urdf_path, mjcf_path=mjcf_path)
-    builder.apply_core_blocks()
+    builder = MjcfBuilder(model_name=model.robot_name, json_cfg=cfg, urdf_model=model, mjcf_path=mjcf_path)
 
-    # Keep URDF materials
-    builder.add_urdf_materials(model.materials)
-
-    # Build worldbody (no sites by default)
-    root_body, body_map, mj_joint_names = _build_worldbody_from_urdf(builder, model)
-
-    # Default: freejoint + decorations (unless JSON overrides)
-    builder.add_freejoint_to_root(root_body)
-    builder.add_world_decorations()
-
-    # Always: contact excludes + mimic constraints
-    builder.add_contact_excludes_from_tree(model)
-    builder.add_mimic_equalities(model)
+    builder.build_worldbody_from_urdf()
 
     # Actuator rules: URDF ros2_control + JSON + default fallback
     config_cfg = cfg.config or {}
-    added_act_urdf = False
-    added_act_json = False
-    added_act_def = False
+    worldbody_cfg = cfg.worldbody or {}
 
-    if bool(config_cfg.get("add_ros2_mujoco_actuator", True)):
-        added_act_urdf = builder.add_actuators_urdf(model)
-    if bool(config_cfg.get("add_json_actuator", True)):
-        added_act_json = builder.add_actuators_from_json(mj_joint_names)
-    if bool(config_cfg.get("add_default_actuator", True)) or config_cfg is None:
-        added_act_def = builder.add_actuators_default(model, mj_joint_names)
+    if bool(config_cfg.get("add_default_compiler", True)):
+        is_add_default_compiler = builder.add_default_compiler()
+    if bool(config_cfg.get("add_default_option", True)):
+        is_add_default_option = builder.add_default_option()
+    if bool(config_cfg.get("add_default_visual", True)):
+        is_add_default_visual = builder.add_default_visual()
+    if bool(config_cfg.get("add_default_default", True)):
+        is_add_default_default = builder.add_default_default()
+    if bool(config_cfg.get("add_default_contact", True)):
+        is_add_default_contact = builder.add_urdf_contact()
+    if bool(worldbody_cfg.get("add_default_floor", True)):
+        is_add_default_worldbody_floor = builder.add_default_worldbody_floor()
+    if bool(worldbody_cfg.get("add_default_skybox", True)):
+        is_add_default_worldbody_skybox = builder.add_default_worldbody_skybox()
+    if bool(worldbody_cfg.get("add_default_light", True)):
+        is_add_default_worldbody_light = builder.add_default_worldbody_light()
+    if bool(worldbody_cfg.get("add_default_freejoint", True)):
+        is_add_default_worldbody_freejoint = builder.add_default_worldbody_freejoint()
 
-    # Sensor rules: URDF sensors + JSON sensors (create sites only when needed)
-    added_sens_urdf = False
-    added_sens_json = False
-    if bool(config_cfg.get("add_ros2_mujoco_sensor", False)):
-        added_sens_urdf = builder.add_sensors_from_urdf(model, body_map)
-    if bool(config_cfg.get("add_json_sensor", False)):
-        added_sens_json = builder.add_sensors_from_json(body_map)
-
-    # Camera rules: JSON only
-    added_cam_json = False
-    if bool(config_cfg.get("add_json_camera", False)):
-        added_cam_json = builder.add_cameras_from_json(body_map)
-
-    # Texture rules: JSON only
-    added_tex_json = False
-    if bool(config_cfg.get("add_json_texture", False)):
-        added_tex_json = builder.add_textures_from_json(body_map)
-
-    # Contact rules: JSON only
-    added_contact_json = False
+    if bool(config_cfg.get("add_json_compiler", False)):
+        is_add_json_compiler = builder.add_json_compiler()
+    if bool(config_cfg.get("add_json_option", False)):
+        is_add_json_option = builder.add_json_option()
+    if bool(config_cfg.get("add_json_visual", False)):
+        is_add_json_visual = builder.add_json_visual()
+    if bool(config_cfg.get("add_json_default", False)):
+        is_add_json_default = builder.add_json_default()
+    if bool(config_cfg.get("add_json_asset", False)):
+        is_add_json_asset = builder.add_json_asset()
     if bool(config_cfg.get("add_json_contact", False)):
-        added_contact_json = builder.add_contact_from_json()
+        is_add_json_contact = builder.add_json_contact()
+    if bool(config_cfg.get("add_json_actuator", False)):
+        is_add_json_actuator = builder.add_json_actuator()
+    if bool(config_cfg.get("add_json_site", False)):
+        is_add_json_visual = builder.add_json_site()
+    if bool(config_cfg.get("add_json_sensor", False)):
+        is_add_json_sensor = builder.add_json_sensor()
+    if bool(config_cfg.get("add_json_light", False)):
+        is_add_json_light = builder.add_json_light()
+    if bool(config_cfg.get("add_json_camera", False)):
+        is_add_json_camera = builder.add_json_camera()
+    if bool(config_cfg.get("add_json_texture", False)):
+        is_add_json_texture = builder.add_json_texture()
+    if bool(config_cfg.get("add_json_customize", False)):
+        is_add_json_customize = builder.add_json_customize()
+    if bool(worldbody_cfg.get("add_json_floor", False)):
+        is_add_json_worldbody_floor = builder.add_json_worldbody_floor()
+    if bool(worldbody_cfg.get("add_json_skybox", False)):
+        is_add_json_worldbody_skybox = builder.add_json_worldbody_skybox()
+    if bool(worldbody_cfg.get("add_json_freejoint", False)):
+        is_add_json_worldbody_freejoint = builder.add_json_worldbody_freejoint()
 
-    logger.info(
-        "Actuators: urdf=%s, json=%s, default=%s | Sensors: urdf=%s, json=%s | Cameras: json=%s | Textures: json=%s | Contact: json=%s",
-        "yes" if added_act_urdf else "no",
-        "yes" if added_act_json else "no",
-        "yes" if added_act_def else "no",
-        "yes" if added_sens_urdf else "no",
-        "yes" if added_sens_json else "no",
-        "yes" if added_cam_json else "no",
-        "yes" if added_tex_json else "no",
-        "yes" if added_contact_json else "no",
-    )
+    if bool(config_cfg.get("add_urdf_material", True)):
+        is_add_urdf_material = builder.add_urdf_material()
+    if bool(config_cfg.get("add_default_actuator", False)):
+        is_add_urdf_actuator_default = builder.add_urdf_actuator_default()
+    if bool(config_cfg.get("add_plugin_actuator", False)):
+        is_add_urdf_actuator_mj_actuator = builder.add_urdf_actuator_mj_actuator()
+    if bool(config_cfg.get("add_urdf_equality", True)):
+        is_add_urdf_equality = builder.add_urdf_equality()
+
+
+    # logger.info(
+    #     "Actuators: urdf=%s, json=%s, default=%s | Sensors: urdf=%s, json=%s | Cameras: json=%s | Textures: json=%s | Contact: json=%s",
+    #     "yes" if added_act_urdf else "no",
+    #     "yes" if added_act_json else "no",
+    #     "yes" if added_act_def else "no",
+    #     "yes" if added_sens_urdf else "no",
+    #     "yes" if added_sens_json else "no",
+    #     "yes" if added_cam_json else "no",
+    #     "yes" if added_tex_json else "no",
+    #     "yes" if added_contact_json else "no",
+    # )
 
     _pretty_write_xml(builder.root, mjcf_path)
     logger.info("Saved MJCF: %s", str(mjcf_path))
@@ -1782,4 +1385,7 @@ def mjcf_generator(
 if __name__ == "__main__":
     # EN: Do not configure logging here; the CLI is the recommended entry.
     # CN: 这里不配置 logging；推荐从 CLI 调用。
+    urdf_path="./examples/urdf/UR5e_fixed_0.urdf"
+    urdf_model = UrdfParser.parse_urdf(urdf_path)
+    mjcf_generator(urdf_model=urdf_model, mjcf_path="./examples/mjcf/UR5e0.xml", json_config_path="./examples/config/config.json")
     pass

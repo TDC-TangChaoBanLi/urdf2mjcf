@@ -4,12 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "urdf2mjcf"
-version = "0.1.0"
+version = "0.2.0"
 description = "URDF to MJCF conversion tool with mesh processing and optional decomposition"
 readme = "README.md"
 requires-python = ">=3.8"
 authors = [
-    {name = "URDF2MJCF Contributors"},
+    {name = "TangChaoBanLi-TDC"},
 ]
 license = {text = "MIT"}
 classifiers = [
