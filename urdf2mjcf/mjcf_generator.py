@@ -869,7 +869,7 @@ class MjcfBuilder:
         worldbody_bodies = self.worldbody.findall("body")
         for worldbody_body in worldbody_bodies:
             if worldbody_body.attrib.get("name") in json_freejoint_bodies:
-                ET.SubElement(worldbody_body, "freejoint")
+                ET.SubElement(worldbody_body, "freejoint", attrib={"name": worldbody_body.attrib.get("name")+"_freejoint"})
                 logger_mjcf.debug(f"Added freejoint to {worldbody_body.attrib.get('name')} from json.")
                 add_num += 1
         return add_num
