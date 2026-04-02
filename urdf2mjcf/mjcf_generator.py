@@ -279,7 +279,7 @@ class MjcfConfig:
     worldbody: Dict[str, Any] = field(default_factory=dict)
     contacts: List[Dict[str, Any]] = field(default_factory=list)
     actuators: List[Dict[str, Any]] = field(default_factory=list)
-    equalitys: List[Dict[str, Any]] = field(default_factory=list)
+    equalities: List[Dict[str, Any]] = field(default_factory=list)
     sites: List[Dict[str, Any]] = field(default_factory=list)
     sensors: List[Dict[str, Any]] = field(default_factory=list)
     lights: List[Dict[str, Any]] = field(default_factory=list)
@@ -379,8 +379,8 @@ class MjcfConfig:
         actuators_json = cls._cfg_get(root, "actuator", {}) or {}
         cls.actuators = cls._load_labeled_config_list(actuators_json)
 
-        equalitys_json = cls._cfg_get(root, "equality", {}) or {}
-        cls.equalitys = cls._load_labeled_config_list(equalitys_json)
+        equalities_json = cls._cfg_get(root, "equality", {}) or {}
+        cls.equalities = cls._load_labeled_config_list(equalities_json)
 
         sites_json = cls._cfg_get(root, "site", {}) or {}
         cls.sites = cls._load_labeled_config_list(sites_json)
@@ -404,7 +404,7 @@ class MjcfConfig:
             len(cls.cameras),
             len(cls.textures),
             len(cls.contacts),
-            len(cls.equalitys),
+            len(cls.equalities),
         )
         return cls
 
@@ -487,10 +487,10 @@ class MjcfBuilder:
             <default>
                 <default class="robot">
                     <default class="visual">
-                        <geom contype="0" conaffinity="0" group="1"/>
+                        <geom contype="0" conaffinity="0" group="2"/>
                     </default>
                     <default class="collision">
-                        <geom contype="1" conaffinity="1" group="2" condim="6"/>
+                        <geom contype="1" conaffinity="1" group="3" condim="6"/>
                     </default>
                 </default>
             </default>
@@ -665,6 +665,16 @@ class MjcfBuilder:
         json_sensor = self.json_cfg.sensors or []
         add_num = self.__add_json_list_configs_label(self.sensor, json_sensor)
         logger_mjcf.debug(f"Added sensor from json: {len(json_sensor)} sensors")
+        return add_num
+
+    def add_json_equality(self) -> int:
+        """
+        添加 json 文件中的 equality 配置
+        
+        """
+        json_equality = self.json_cfg.equalities or []
+        add_num = self.__add_json_list_configs_label(self.equality, json_equality)
+        logger_mjcf.debug(f"Added equality from json: {len(json_equality)} equalities")
         return add_num
         
     @staticmethod
@@ -1335,6 +1345,8 @@ def mjcf_generator(
         is_add_json_asset = builder.add_json_asset()
     if bool(config_cfg.get("add_json_contact", False)):
         is_add_json_contact = builder.add_json_contact()
+    if bool(config_cfg.get("add_json_equality", False)):
+        is_add_json_equality = builder.add_json_equality()
     if bool(config_cfg.get("add_json_actuator", False)):
         is_add_json_actuator = builder.add_json_actuator()
     if bool(config_cfg.get("add_json_site", False)):
