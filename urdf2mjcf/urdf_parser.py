@@ -144,6 +144,7 @@ class UrdfParser:
     
     mj_joints: List[UrdfParser.UrdfMjJoint] = field(default_factory=list)
     mj_sensors: List[UrdfParser.UrdfMjSensor] = field(default_factory=list)
+    urdf_file_path: Path = None
 
     @classmethod
     def parse_urdf(cls, urdf_path: Union[str, Path]) -> UrdfParser:
@@ -164,6 +165,7 @@ class UrdfParser:
         instance.joints, instance.parent_map = instance._parse_joints(robot_elem)
         instance.links = instance._parse_links(robot_elem)
         instance.root_link = instance._get_root_link(instance.parent_map)
+        instance.urdf_file_path = p
         instance.mj_joints, instance.mj_sensors = instance._parse_mujoco_ros_control(urdf_tree)
 
         logger.info(

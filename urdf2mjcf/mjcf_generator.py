@@ -74,6 +74,50 @@ def _safe_float(x: Optional[str], default: float = 0.0) -> float:
         return default
 
 
+def _resolve_mesh_path(urdf_file_path: Path, mesh_path: str, mjcf_output_path: Path) -> str:
+    """
+    EN: Resolve mesh file path from URDF relative path to MJCF relative path.
+    CN: 将mesh文件路径从URDF中的相对路径转换为相对于输出MJCF文件的路径。
+    
+    :param urdf_file_path: URDF文件的绝对路径
+    :param mesh_path: URDF中定义的mesh文件路径（可能是相对路径或绝对路径）
+    :param mjcf_output_path: 输出MJCF文件的路径（可以是相对或绝对路径）
+    :return: 相对于MJCF文件的mesh路径
+    """
+    mesh_path_obj = Path(mesh_path)
+    
+    if mesh_path_obj.is_absolute():
+        abs_mesh_path = mesh_path_obj.resolve()
+    else:
+        urdf_dir = urdf_file_path.parent.resolve()
+        abs_mesh_path = (urdf_dir / mesh_path_obj).resolve()
+    
+    mjcf_dir = mjcf_output_path.resolve().parent
+    
+    try:
+        relative_path = abs_mesh_path.relative_to(mjcf_dir)
+        return str(relative_path)
+    except ValueError:
+        pass
+    
+    for up_levels in range(1, 4):
+        parent_dir = mjcf_dir
+        for _ in range(up_levels):
+            parent_dir = parent_dir.parent
+            if parent_dir == parent_dir.parent:
+                break
+        
+        try:
+            relative_path = abs_mesh_path.relative_to(parent_dir)
+            prefix = "../" * up_levels
+            return prefix + str(relative_path)
+        except ValueError:
+            continue
+    
+    logger.warning(f"Mesh path '{abs_mesh_path}' is not within 3 levels of MJCF directory '{mjcf_dir}'. Using absolute path.")
+    return str(abs_mesh_path)
+
+
 def _str2vec(x: str) -> tuple:
     """
     EN: Normalize string to numeric triple.
@@ -1098,7 +1142,7 @@ class MjcfBuilder:
         
 
     @staticmethod
-    def _build_body(parent: ET.Element[str], link: UrdfParser.UrdfLink, joint:Optional[UrdfParser.UrdfJoint],  asset:ET.Element[str]) -> Optional[ET.Element[str]]:
+    def _build_body(parent: ET.Element[str], link: UrdfParser.UrdfLink, joint:Optional[UrdfParser.UrdfJoint],  asset:ET.Element[str], urdf_file_path: Path = None, mjcf_output_path: Path = None) -> Optional[ET.Element[str]]:
         """
         构建 body 节点
         
@@ -1106,6 +1150,8 @@ class MjcfBuilder:
         :param link: 要构建的 body 在 urdf 中的 link
         :param joint: 以 link 为子节点的 joint
         :param asset: 资源节点，用于添加 mesh
+        :param urdf_file_path: URDF文件路径，用于解析相对路径的mesh
+        :param mjcf_output_path: MJCF输出路径，用于生成相对路径
         :return: 添加的 body 节点
         """
         # 构建 body
@@ -1182,7 +1228,11 @@ class MjcfBuilder:
                         collision_geom_attribs["material"] = collision.material.m_name
                 if collision.geometry.g_type == "mesh":
                     mesh_name = "MESH_" + collision.geometry.filename.split("/")[-1].split(".")[0] # 文件名不带扩展名
-                    MjcfBuilder._add_mesh(asset=asset, attribs={"name": mesh_name, "file": collision.geometry.filename})
+                    if urdf_file_path and mjcf_output_path:
+                        mesh_file_path = _resolve_mesh_path(urdf_file_path, collision.geometry.filename, mjcf_output_path)
+                    else:
+                        mesh_file_path = collision.geometry.filename
+                    MjcfBuilder._add_mesh(asset=asset, attribs={"name": mesh_name, "file": mesh_file_path})
                     collision_geom_attribs["mesh"] = mesh_name
                 elif collision.geometry.g_type == "box":
                     collision_geom_attribs["size"] = _vec2str(x/2.0 for x in _str2vec(collision.geometry.size))
@@ -1211,7 +1261,11 @@ class MjcfBuilder:
                         visual_geom_attribs["material"] = visual.material.m_name
                 if visual.geometry.g_type == "mesh":
                     mesh_name = "MESH_" + visual.geometry.filename.split("/")[-1].split(".")[0] # 文件名不带扩展名
-                    MjcfBuilder._add_mesh(asset=asset, attribs={"name": mesh_name, "file": visual.geometry.filename})
+                    if urdf_file_path and mjcf_output_path:
+                        mesh_file_path = _resolve_mesh_path(urdf_file_path, visual.geometry.filename, mjcf_output_path)
+                    else:
+                        mesh_file_path = visual.geometry.filename
+                    MjcfBuilder._add_mesh(asset=asset, attribs={"name": mesh_name, "file": mesh_file_path})
                     visual_geom_attribs["mesh"] = mesh_name
                 elif visual.geometry.g_type == "box":
                     visual_geom_attribs["size"] = _vec2str(x/2.0 for x in _str2vec(visual.geometry.size))
@@ -1238,7 +1292,9 @@ class MjcfBuilder:
         else:
             urdf_joint = None
         # build the root body to worldbody
-        root_body: ET.Element[str] = MjcfBuilder._build_body(self.worldbody, urdf_link, urdf_joint, asset=self.asset)
+        root_body: ET.Element[str] = MjcfBuilder._build_body(self.worldbody, urdf_link, urdf_joint, asset=self.asset, 
+                                                            urdf_file_path=self.urdf_model.urdf_file_path, 
+                                                            mjcf_output_path=self.mjcf_path)
         
         def rec_build_bodies(parent_elem: ET.Element[str],):
             """
@@ -1256,7 +1312,9 @@ class MjcfBuilder:
                     else:
                         urdf_joint = None
 
-                    body = MjcfBuilder._build_body(parent_elem, urdf_link, urdf_joint, asset=self.asset)
+                    body = MjcfBuilder._build_body(parent_elem, urdf_link, urdf_joint, asset=self.asset, 
+                                                   urdf_file_path=self.urdf_model.urdf_file_path, 
+                                                   mjcf_output_path=self.mjcf_path)
 
                     rec_build_bodies(body)
 
