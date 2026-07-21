@@ -16,6 +16,7 @@ classifiers = [
 ]
 dependencies = [
     "numpy>=1.21.0",
+    "pycollada>=0.9.3",
     "trimesh>=3.12.0",
 ]
 

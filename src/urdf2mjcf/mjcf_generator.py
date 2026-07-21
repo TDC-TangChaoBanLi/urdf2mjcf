@@ -991,7 +991,10 @@ class MjcfBuilder:
             mimic_offset = joint.mimic.offset
 
             polycoef = [mimic_offset, mimic_multiplier, 0, 0, 0]
-            attraibs = {"joint1": mimic_link_name, "joint2": joint_name, "polycoef": _vec2str(polycoef)}
+            # MuJoCo: joint1 = polycoef[0] + polycoef[1]*joint2 + ...
+            # URDF:   follower(当前joint) = offset + multiplier * leader(mimic.joint)
+            # 所以 joint1=从动关节(当前), joint2=主动关节(mimic目标)
+            attraibs = {"joint1": joint_name, "joint2": mimic_link_name, "polycoef": _vec2str(polycoef)}
             ET.SubElement(self.equality, "joint", attrib=attraibs)
             add_num += 1
         return add_num
@@ -1255,7 +1258,10 @@ class MjcfBuilder:
                         mesh_file_path = _resolve_mesh_path(urdf_file_path, collision.geometry.filename, mjcf_output_path)
                     else:
                         mesh_file_path = collision.geometry.filename
-                    MjcfBuilder._add_mesh(asset=asset, attribs={"name": mesh_name, "file": mesh_file_path})
+                    mesh_attribs: Dict[str, Any] = {"name": mesh_name, "file": mesh_file_path}
+                    if collision.geometry.scale:
+                        mesh_attribs["scale"] = collision.geometry.scale
+                    MjcfBuilder._add_mesh(asset=asset, attribs=mesh_attribs)
                     collision_geom_attribs["mesh"] = mesh_name
                 elif collision.geometry.g_type == "box":
                     collision_geom_attribs["size"] = _vec2str(x/2.0 for x in _str2vec(collision.geometry.size))
@@ -1288,7 +1294,10 @@ class MjcfBuilder:
                         mesh_file_path = _resolve_mesh_path(urdf_file_path, visual.geometry.filename, mjcf_output_path)
                     else:
                         mesh_file_path = visual.geometry.filename
-                    MjcfBuilder._add_mesh(asset=asset, attribs={"name": mesh_name, "file": mesh_file_path})
+                    mesh_attribs: Dict[str, Any] = {"name": mesh_name, "file": mesh_file_path}
+                    if visual.geometry.scale:
+                        mesh_attribs["scale"] = visual.geometry.scale
+                    MjcfBuilder._add_mesh(asset=asset, attribs=mesh_attribs)
                     visual_geom_attribs["mesh"] = mesh_name
                 elif visual.geometry.g_type == "box":
                     visual_geom_attribs["size"] = _vec2str(x/2.0 for x in _str2vec(visual.geometry.size))
