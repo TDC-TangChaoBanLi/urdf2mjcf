@@ -15,16 +15,14 @@
 
 ## 安装
 
-基础安装：
+本项目使用 [uv](https://docs.astral.sh/uv/) 进行依赖管理。
 
 ```bash
-pip install .
-```
+# 使用 uv 安装（自动创建虚拟环境并安装全部依赖）
+uv sync
 
-安装含凸包分解支持：
-
-```bash
-pip install .[coacd]
+# 安装含凸包分解支持
+uv sync --extra coacd
 ```
 
 ## 命令行使用
@@ -32,7 +30,7 @@ pip install .[coacd]
 转换 URDF 和 mesh：
 
 ```bash
-urdf2mjcf robot.urdf -o robot.xml -m ./meshes
+uv run urdf2mjcf robot.urdf -o robot.xml -m ./meshes
 ```
 
 查看全部选项：
@@ -133,6 +131,10 @@ JSON 配置文件示例:
                 {"name": "cube_B_link_TEXTURE", "file": "../assets/tag36h11-101.png", "pos": "0.0 0.0 0.025", "euler": "0.0 0.0 0.0", "size": "0.05 0.05"}
             ]
         },
+        "gravcomp":{
+            "add_gravcomp": false,          // 设为 true 则为全部 body 开启重力补偿；也可用列表指定 body: ["body_1", "body_2"]
+            "add_actuatorgravcomp": false   // 设为 true 则为全部 joint 开启控制力重力补偿；也可用列表指定 joint: ["joint_1", "joint_2"]
+        },
         "contact":{
             "exclude": [
                 {"body1": "robotiq_85_left_finger_tip_link", "body2": "robotiq_85_left_inner_knuckle_link"},
@@ -146,13 +148,19 @@ JSON 配置文件示例:
 ## 项目结构
 
 ```
-urdf2mjcf/
+src/urdf2mjcf/
 ├── __init__.py              # 包入口
 ├── cli.py                   # 命令行界面
 ├── mesh_converter.py        # 核心 mesh 转换逻辑
 ├── mjcf_generator.py        # URDF 到 MJCF 转换
 ├── mesh_decomposer.py       # OBJ 后处理和分解
 └── py.typed                 # 类型提示标记
+
+pyproject.toml               # 项目元数据和依赖
+uv.lock                      # 锁定文件（uv 自动生成）
+README.md                    # 英文文档
+README_zh.md                 # 本文件
+LICENSE                      # MIT 许可证
 ```
 
 ## 主要特性

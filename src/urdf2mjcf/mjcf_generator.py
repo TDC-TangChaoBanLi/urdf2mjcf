@@ -321,6 +321,7 @@ class MjcfConfig:
 
     assets: List[Dict[str, Any]] = field(default_factory=list)
     worldbody: Dict[str, Any] = field(default_factory=dict)
+    gravcomp: Dict[str, Any] = field(default_factory=dict)
     contacts: List[Dict[str, Any]] = field(default_factory=list)
     actuators: List[Dict[str, Any]] = field(default_factory=list)
     equalities: List[Dict[str, Any]] = field(default_factory=list)
@@ -416,6 +417,9 @@ class MjcfConfig:
 
         worldbody_json = cls._cfg_get(root, "worldbody", {}) or {}
         cls.worldbody = worldbody_json
+
+        gravcomp_json = cls._cfg_get(root, "gravcomp", {}) or {}
+        cls.gravcomp = gravcomp_json
 
         contacts_json = cls._cfg_get(root, "contact", {}) or {}
         cls.contacts = cls._load_labeled_config_list(contacts_json)
@@ -1142,7 +1146,7 @@ class MjcfBuilder:
         
 
     @staticmethod
-    def _build_body(parent: ET.Element[str], link: UrdfParser.UrdfLink, joint:Optional[UrdfParser.UrdfJoint],  asset:ET.Element[str], urdf_file_path: Path = None, mjcf_output_path: Path = None) -> Optional[ET.Element[str]]:
+    def _build_body(parent: ET.Element[str], link: UrdfParser.UrdfLink, joint:Optional[UrdfParser.UrdfJoint],  asset:ET.Element[str], urdf_file_path: Path = None, mjcf_output_path: Path = None, gravcomp_config: Optional[Dict[str, Any]] = None) -> Optional[ET.Element[str]]:
         """
         构建 body 节点
         
@@ -1152,6 +1156,7 @@ class MjcfBuilder:
         :param asset: 资源节点，用于添加 mesh
         :param urdf_file_path: URDF文件路径，用于解析相对路径的mesh
         :param mjcf_output_path: MJCF输出路径，用于生成相对路径
+        :param gravcomp_config: 重力补偿配置，包含 add_gravcomp 和 add_actuatorgravcomp
         :return: 添加的 body 节点
         """
         # 构建 body
@@ -1160,6 +1165,15 @@ class MjcfBuilder:
             "pos": joint.origin.xyz if joint is not None else "0 0 0",
             "quat": _vec2str(_rpy_to_quaternion(_str2vec(joint.origin.rpy))) if joint is not None else "0 0 0",
         }
+
+        # 重力补偿：body 级别
+        if gravcomp_config:
+            add_gravcomp = gravcomp_config.get("add_gravcomp", False)
+            if add_gravcomp is True:
+                body_attribs["gravcomp"] = "1"
+            elif isinstance(add_gravcomp, list) and link.l_name in add_gravcomp:
+                body_attribs["gravcomp"] = "1"
+
         body = MjcfBuilder._add_body(parent, body_attribs)
         if body is None:
             return None
@@ -1208,6 +1222,15 @@ class MjcfBuilder:
                     joint_attribs["type"] = "hinge"
                 elif joint.j_type == "prismatic":
                     joint_attribs["type"] = "slide"
+
+                # 重力补偿：joint 级别 (actuatorgravcomp)
+                if gravcomp_config:
+                    add_actuatorgravcomp = gravcomp_config.get("add_actuatorgravcomp", False)
+                    if add_actuatorgravcomp is True:
+                        joint_attribs["actuatorgravcomp"] = "true"
+                    elif isinstance(add_actuatorgravcomp, list) and joint.j_name in add_actuatorgravcomp:
+                        joint_attribs["actuatorgravcomp"] = "true"
+
                 MjcfBuilder._add_joint(body, joint_attribs)
 
         # 构建 collision geom
@@ -1282,6 +1305,8 @@ class MjcfBuilder:
         """
         Builds the worldbody from the URDF model
         """
+        gravcomp_config = self.json_cfg.gravcomp if self.json_cfg.gravcomp else None
+
         root_name = self.urdf_model.root_link
         # get the UrdfLink named child_name
         urdf_link = list(filter(lambda link: link.l_name == root_name, self.urdf_model.links))[0]
@@ -1294,7 +1319,8 @@ class MjcfBuilder:
         # build the root body to worldbody
         root_body: ET.Element[str] = MjcfBuilder._build_body(self.worldbody, urdf_link, urdf_joint, asset=self.asset, 
                                                             urdf_file_path=self.urdf_model.urdf_file_path, 
-                                                            mjcf_output_path=self.mjcf_path)
+                                                            mjcf_output_path=self.mjcf_path,
+                                                            gravcomp_config=gravcomp_config)
         
         def rec_build_bodies(parent_elem: ET.Element[str],):
             """
@@ -1314,7 +1340,8 @@ class MjcfBuilder:
 
                     body = MjcfBuilder._build_body(parent_elem, urdf_link, urdf_joint, asset=self.asset, 
                                                    urdf_file_path=self.urdf_model.urdf_file_path, 
-                                                   mjcf_output_path=self.mjcf_path)
+                                                   mjcf_output_path=self.mjcf_path,
+                                                   gravcomp_config=gravcomp_config)
 
                     rec_build_bodies(body)
 

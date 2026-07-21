@@ -1,62 +1,50 @@
-[build-system]
-requires = ["setuptools>=45", "wheel"]
-build-backend = "setuptools.build_meta"
-
 [project]
 name = "urdf2mjcf"
 version = "0.2.0"
 description = "URDF to MJCF conversion tool with mesh processing and optional decomposition"
 readme = "README.md"
-requires-python = ">=3.8"
 authors = [
-    {name = "TangChaoBanLi-TDC"},
+    { name = "TangChaoBanLi-TDC" },
 ]
-license = {text = "MIT"}
+license = { text = "MIT" }
+requires-python = ">=3.12"
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.8",
-    "Programming Language :: Python :: 3.9",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
 ]
 dependencies = [
-    "trimesh>=3.12.0",
     "numpy>=1.21.0",
-]
-
-[project.optional-dependencies]
-coacd = ["coacd>=1.0.0"]
-dev = [
-    "pytest>=7.0",
-    "pytest-cov>=4.0",
-    "black>=22.0",
-    "isort>=5.0",
-    "mypy>=0.990",
-    "ruff>=0.0.250",
+    "trimesh>=3.12.0",
 ]
 
 [project.scripts]
 urdf2mjcf = "urdf2mjcf.cli:main"
 
-[tool.setuptools]
-packages = ["urdf2mjcf"]
+[project.optional-dependencies]
+coacd = [
+    "coacd>=1.0.0",
+]
 
-[tool.black]
+[build-system]
+requires = ["uv_build>=0.11.23,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "mypy>=0.990",
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "ruff>=0.0.250",
+]
+
+[tool.ruff]
 line-length = 100
-target-version = ['py38']
+target-version = "py312"
 
-[tool.isort]
-profile = "black"
-line_length = 100
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W"]
 
-[tool.mypy]
-python_version = "3.8"
-disallow_untyped_defs = false
-disallow_incomplete_defs = false
-check_untyped_defs = false
-warn_unused_ignores = true
-warn_redundant_casts = true
-warn_unused_configs = true
+[tool.ruff.format]
+quote-style = "double"
