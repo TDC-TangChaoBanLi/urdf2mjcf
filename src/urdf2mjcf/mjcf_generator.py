@@ -85,28 +85,30 @@ def _resolve_mesh_path(urdf_file_path: Path, mesh_path: str, mjcf_output_path: P
     :return: 相对于MJCF文件的mesh路径
     """
     mesh_path_obj = Path(mesh_path)
-    
+
+    # 注意：使用 abspath 而非 resolve()，避免把 meshes 目录下的软链接
+    # 解析回真实源路径（symlink 复制模式会破坏指向 meshes/ 的引用）。
     if mesh_path_obj.is_absolute():
-        abs_mesh_path = mesh_path_obj.resolve()
+        abs_mesh_path = Path(os.path.abspath(mesh_path_obj))
     else:
-        urdf_dir = urdf_file_path.parent.resolve()
-        abs_mesh_path = (urdf_dir / mesh_path_obj).resolve()
-    
-    mjcf_dir = mjcf_output_path.resolve().parent
+        urdf_dir = Path(os.path.abspath(urdf_file_path.parent))
+        abs_mesh_path = Path(os.path.abspath(urdf_dir / mesh_path_obj))
+
+    mjcf_dir = Path(os.path.abspath(mjcf_output_path)).parent
     
     try:
         relative_path = abs_mesh_path.relative_to(mjcf_dir)
         return str(relative_path)
     except ValueError:
         pass
-    
+
     for up_levels in range(1, 4):
         parent_dir = mjcf_dir
         for _ in range(up_levels):
             parent_dir = parent_dir.parent
             if parent_dir == parent_dir.parent:
                 break
-        
+
         try:
             relative_path = abs_mesh_path.relative_to(parent_dir)
             prefix = "../" * up_levels
@@ -1166,7 +1168,9 @@ class MjcfBuilder:
         body_attribs = {
             "name": link.l_name,
             "pos": joint.origin.xyz if joint is not None else "0 0 0",
-            "quat": _vec2str(_rpy_to_quaternion(_str2vec(joint.origin.rpy))) if joint is not None else "0 0 0",
+            "quat": _vec2str(_rpy_to_quaternion(_str2vec(joint.origin.rpy)))
+            if joint is not None
+            else "1 0 0 0",
         }
 
         # 重力补偿：body 级别

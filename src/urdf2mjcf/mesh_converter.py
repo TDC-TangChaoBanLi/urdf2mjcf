@@ -22,23 +22,20 @@ CN:
 
 from __future__ import annotations
 
-import glob
 import hashlib
+import json
 import logging
 import os
 import pathlib
+import re
 import shutil
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
 import trimesh
 
-
-
 from .urdf_parser import UrdfParser
-import json
-from pathlib import Path
 
 # IMPORTANT:
 # EN: Do NOT call logging.basicConfig() here. CLI configures logging globally.
@@ -60,7 +57,7 @@ def _vec2str(vec: Optional[list|tuple]) -> Optional[str]:
     """
     EN: Convert numeric list or tuple to space-separated string.
     CN: 将数值列表或元组转换为空格分隔的字符串。
-    
+
     :param vec: A list or tuple containing numeric values
     :return: Space-separated string representation
     """
@@ -69,12 +66,11 @@ def _vec2str(vec: Optional[list|tuple]) -> Optional[str]:
     return " ".join(str(float(v)) for v in vec)
 
 
-
 class MeshConverter:
-    def __init__(self, 
+    def __init__(self,
                 output_path: Union[str, Path],
-                urdf_model: UrdfParser, 
-                json_path: Optional[Union[str, Path]], 
+                urdf_model: UrdfParser,
+                json_path: Optional[Union[str, Path]],
                 meshes_dir: Optional[Union[str, Path]],
                 is_copy_meshes: bool = True,
                 is_symlink_copy: bool = False
@@ -183,7 +179,7 @@ class MeshConverter:
             else:
                 logger.error(f"Can not find mesh file: '{path}', resolve to: '{p}'")
                 return None
-        
+
         else:
             if Path(p).is_file():
                 return p
@@ -206,7 +202,7 @@ class MeshConverter:
         source_path = Path(source_path)
         dest_dir = Path(dest_dir)
         dest_name = Path(dest_name).stem
-        
+
         output_paths = []
 
         # 加载模型
@@ -232,7 +228,7 @@ class MeshConverter:
             mesh.export(dest_path, file_type="stl")
             output_paths.append(dest_path)
             logger.debug(f"Converted '{source_path.name}' to {dest_name}.stl")
-        
+
         return output_paths
 
     @staticmethod
@@ -255,10 +251,10 @@ class MeshConverter:
         """
         将 mtl 文件信息解析为 rgba 信息
 
-
+        :param mtl_path: MTL 文件路径
+        :return: 该 MTL 中最后一个 newmtl 的 (r, g, b, a)；无有效信息返回 None
         """
         mtl_path = Path(mtl_path)
-        # rgba = (1,1,1,1)
         if not mtl_path.is_file():
             return None
         current_name: Optional[str] = None
@@ -273,9 +269,7 @@ class MeshConverter:
                 lower = s.lower()
 
                 if lower.startswith("newmtl"):
-                    if current_name and kd:
-                        r, g, b = kd
-                        mtl_path[current_name] = f"{r} {g} {b} {alpha}"
+                    # 前一个材质已处理完；kd 只在后续行出现
                     parts = s.split(maxsplit=1)
                     current_name = parts[1].strip() if len(parts) > 1 else None
                     kd = None
@@ -304,10 +298,104 @@ class MeshConverter:
 
         if current_name and kd:
             r, g, b = kd
-            rgba = tuple((r,g,b,alpha))
+            rgba = tuple((r, g, b, alpha))
             return rgba
         else:
             return None
+
+    def _copy_obj_sidecar_files(
+        self, obj_src: Path, obj_dest: Path, is_symlink_copy: bool
+    ) -> List[Path]:
+        """
+        复制（或软链接）OBJ 文件引用到的 MTL 文件，以及 MTL 引用的贴图文件
+        到 obj_dest 所在目录，保证复制后的 OBJ 在目标目录材质完整。
+
+        :param obj_src: 源 OBJ 文件绝对路径
+        :param obj_dest: 目标 OBJ 文件绝对路径（已复制/将复制）
+        :param is_symlink_copy: 是否使用软链接
+        :return: 已复制/软链接的伴随文件路径列表（用于去重 exclude）
+        """
+        if obj_src.suffix.lower() != ".obj":
+            return []
+        try:
+            with obj_src.open("r", encoding="utf-8", errors="ignore") as f:
+                obj_text = f.read()
+        except OSError as e:
+            logger.warning(f"Failed to read OBJ {obj_src}: {e}")
+            return []
+
+        copied: List[Path] = []
+        dest_dir = obj_dest.parent
+        dest_dir.mkdir(parents=True, exist_ok=True)
+
+        # 1) 收集 OBJ 引用的所有 mtllib 文件
+        mtl_names = re.findall(r"(?im)^mtllib\s+(.+?)(?:\s*#.*)?$", obj_text)
+        mtl_paths: List[Path] = []
+        for name in mtl_names:
+            for token in name.split():
+                if token.lower().endswith(".mtl"):
+                    mtl_paths.append(obj_src.parent / token)
+                    break
+
+        # 2) 复制/软链每个 MTL，并解析其 map_Kd 引用的贴图；
+        #    MTL 中贴图路径被改写为 basename（贴图一并复制到目标同目录）
+        tex_pattern = re.compile(r"(?im)^(\s*map_Kd\s+(?:-[A-Za-z0-9_]+\s+(?:\S+\s+)*?)?)(\S+\.\w+)\s*$")
+        for mtl_src in mtl_paths:
+            if not mtl_src.is_file():
+                logger.warning(f"MTL file not found: {mtl_src}")
+                continue
+            mtl_dest = dest_dir / mtl_src.name
+
+            # 读取 MTL，处理 map_Kd 相对路径 -> basename
+            try:
+                mtl_text = mtl_src.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                mtl_text = None
+
+            # 收集贴图源文件并复制
+            tex_map: Dict[str, Path] = {}  # basename -> 源路径
+            if mtl_text is not None:
+                for m in tex_pattern.finditer(mtl_text):
+                    tex_rel = m.group(2).strip()
+                    if not tex_rel:
+                        continue
+                    tex_src = (mtl_src.parent / tex_rel).resolve()
+                    if not tex_src.is_file():
+                        logger.warning(f"Texture file not found: {tex_src}")
+                        continue
+                    tex_map[tex_src.name] = tex_src
+
+            for tex_name, tex_src in tex_map.items():
+                tex_dest = dest_dir / tex_name
+                if is_symlink_copy:
+                    if not os.path.lexists(tex_dest):
+                        os.symlink(os.path.abspath(tex_src), tex_dest)
+                else:
+                    if not os.path.lexists(tex_dest):
+                        shutil.copy2(tex_src, tex_dest)
+                logger.debug(f"Copied texture sidecar: {tex_src} -> {tex_dest}")
+                copied.append(tex_dest)
+
+            # 写 MTL：map_Kd 路径改 basename（贴图已在同目录）
+            if mtl_text is not None and tex_map:
+                new_text = tex_pattern.sub(
+                    lambda m: f"{m.group(1)}{Path(m.group(2)).name}", mtl_text
+                )
+                if is_symlink_copy:
+                    if not os.path.lexists(mtl_dest):
+                        os.symlink(os.path.abspath(mtl_src), mtl_dest)
+                else:
+                    mtl_dest.write_text(new_text, encoding="utf-8")
+            else:
+                if is_symlink_copy:
+                    if not os.path.lexists(mtl_dest):
+                        os.symlink(os.path.abspath(mtl_src), mtl_dest)
+                else:
+                    if not os.path.lexists(mtl_dest):
+                        shutil.copy2(mtl_src, mtl_dest)
+            logger.debug(f"Copied MTL sidecar: {mtl_src} -> {mtl_dest}")
+            copied.append(mtl_dest)
+        return copied
 
     def convert_meshes(self) -> UrdfParser:
 
@@ -331,11 +419,10 @@ class MeshConverter:
                 mesh_hash = MeshConverter._compute_mesh_hash(source_mesh_path) # compute hash
 
                 # 如果源文件不是 stl 或者 obj ，则直接转换为 obj 到指定 mesh 目录下：
-                if not (Path(source_mesh_path).suffix in ['.stl', '.obj', '.STL', '.OBJ']):
+                if Path(source_mesh_path).suffix not in ['.stl', '.obj', '.STL', '.OBJ']:
                     dest_mesh_name = Path(source_mesh_path).stem + "_" + mesh_hash # dest_mesh_name: SrcMeshName_[hash8].obj
                     dest_mesh_format = "obj" if isinstance(v_or_c, UrdfParser.UrdfVisual) else "stl" # 目标格式： visual: obj | collision: stl
                     added_meshes_once = MeshConverter._convert_mesh(source_mesh_path, self.meshes_dir, dest_mesh_name, dest_mesh_format) # 转换 mesh 格式
-                    added_materials_once: List[Path] = []
 
                     exclude_meshes.extend(added_meshes_once)
                     is_visual = True if isinstance(v_or_c, UrdfParser.UrdfVisual) else False
@@ -363,39 +450,47 @@ class MeshConverter:
                     dest_mesh_name = Path(source_mesh_path).stem + "_" + mesh_hash + Path(source_mesh_path).suffix
                     dest_mesh_path = self.meshes_dir.joinpath(dest_mesh_name)
                     if self.is_symlink_copy:
-                        if not os.path.exists(dest_mesh_path):
-                            os.symlink(source_mesh_path, dest_mesh_path) # 创建软链接
-                            logger.debug(f"Created mesh symlink: {dest_mesh_path} -> {source_mesh_path}")
+                        if not os.path.lexists(dest_mesh_path):
+                            # 源使用绝对路径，避免相对源在移动/二次处理时产生悬空链接
+                            os.symlink(os.path.abspath(source_mesh_path), dest_mesh_path)
+                            logger.debug(f"Created mesh symlink: {dest_mesh_path} -> {os.path.abspath(source_mesh_path)}")
                     else:
-                        if not os.path.exists(dest_mesh_path):
+                        if not os.path.lexists(dest_mesh_path):
                             shutil.copy2(source_mesh_path, dest_mesh_path) # 复制文件
                             logger.debug(f"Copied mesh file: {source_mesh_path} -> {dest_mesh_path}")
-                    
+
+                    # 若复制的是 OBJ：连带复制其 MTL 与贴图，保证目标目录材质完整
+                    if Path(source_mesh_path).suffix.lower() == ".obj":
+                        sidecar_paths = self._copy_obj_sidecar_files(
+                            Path(source_mesh_path), dest_mesh_path, self.is_symlink_copy
+                        )
+                        exclude_meshes.extend(sidecar_paths)
+
                     v_or_c.geometry.filename = str(dest_mesh_path)
                     continue
 
                 # 如果不是复制，那么直接使用源 mesh 的路径：
-                else: 
+                else:
                     if Path(source_mesh_path).is_relative_to(Path.cwd()) and Path(source_mesh_path).is_absolute():
                         dest_mesh_path = Path(source_mesh_path).relative_to(Path.cwd())
                     else:
                         dest_mesh_path = Path(source_mesh_path)
-                    
+
                     v_or_c.geometry.filename = str(dest_mesh_path)
                     continue
 
         # Iterate through links
         added_meshes = []
         for link in self.urdf_model.links:
-            
+
             # Iterate through all the visuals
             if link.visuals is not None:
                 convert_visual_collision(link.visuals, added_meshes)
-            
+
             # Iterate through all the collisions
             if link.collisions is not None:
                 convert_visual_collision(link.collisions, added_meshes)
-        
+
         return self.urdf_model
 
 
@@ -414,7 +509,7 @@ class MeshConverter:
                 # 添加 visual / collision
                 tag = "visual" if isinstance(model_v_or_c, UrdfParser.UrdfVisual) else "collision"
                 new_vc_elem = ET.SubElement(link_elem, tag)
-                
+
                 # 添加 origin
                 ET.SubElement(new_vc_elem, "origin", attrib={"xyz": model_v_or_c.origin.xyz, "rpy": model_v_or_c.origin.rpy})
 
@@ -433,9 +528,9 @@ class MeshConverter:
                     urdf_dir = Path(self.output_path).parent # urdf 文件所在目录
                     mesh_path = Path(model_v_or_c.geometry.filename) # mesh 文件路径
                     if mesh_path.resolve().is_relative_to(Path.cwd().resolve()): # 如果 mesh_path 在当前目录内 使用相对路径
-                        model_v_or_c.geometry.filename = os.path.relpath(str(mesh_path),str(urdf_dir)) 
+                        model_v_or_c.geometry.filename = os.path.relpath(str(mesh_path),str(urdf_dir))
                     elif mesh_path.resolve().is_relative_to(urdf_dir.parent.resolve()): # 如果 mesh_path 在 urdf_dir 的父目录内 使用相对路径
-                        model_v_or_c.geometry.filename = os.path.relpath(str(mesh_path),str(urdf_dir)) 
+                        model_v_or_c.geometry.filename = os.path.relpath(str(mesh_path),str(urdf_dir))
                     else:
                         model_v_or_c.geometry.filename = str(mesh_path.resolve()) # 使用绝对路径
                     ET.SubElement(new_geom_elem, "mesh", attrib={"filename": model_v_or_c.geometry.filename})
@@ -461,8 +556,8 @@ class MeshConverter:
                 model_link = model_link[0]
             else:
                 continue
-            
-            # 添加所有 visual 
+
+            # 添加所有 visual
             if len(model_link.visuals) > 0:
                 add_new_visuals_or_collisions(link_elem, model_link.visuals)
 
@@ -475,10 +570,10 @@ class MeshConverter:
 def mesh_converter(urdf_model: UrdfParser, output_path: Path, meshes_dir: Path, is_copy_meshes: bool = True, is_symlink_copy: bool = False):
     mesh_converter = MeshConverter(
         output_path=output_path,
-        urdf_model=urdf_model, 
-        json_path=None, 
-        meshes_dir=meshes_dir, 
-        is_copy_meshes = is_copy_meshes, 
+        urdf_model=urdf_model,
+        json_path=None,
+        meshes_dir=meshes_dir,
+        is_copy_meshes = is_copy_meshes,
         is_symlink_copy= is_symlink_copy
     )
     mesh_converter.convert_meshes()

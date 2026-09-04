@@ -25,8 +25,8 @@ from pathlib import Path
 from typing import Optional
 
 from .mesh_converter import mesh_converter
+from .mesh_decomposer import mesh_decomposer
 from .mjcf_generator import mjcf_generator
-# from .mesh_decomposer import mesh_decomposer
 from .urdf_parser import UrdfParser
 
 # Logger for this module
@@ -215,7 +215,7 @@ def main() -> None:
         logger.error("Failed to create output directories: %s", e, exc_info=True)
         sys.exit(1)
 
-    total_steps = 3
+    total_steps = 4
 
     log_step_header(1, total_steps, "Parse URDF")
     try:
@@ -250,6 +250,20 @@ def main() -> None:
         logger.info("MJCF generation finished successfully.")
     except Exception as e:
         logger.error("MJCF generation failed: %s", e, exc_info=True)
+        sys.exit(1)
+
+    log_step_header(4, total_steps, "Post-process meshes in MJCF")
+    try:
+        mesh_decomposer(
+                xml_path=output_path,
+                decompose_target=args.decompose,
+                config_path=args.json_config,
+                is_copy_meshes=args.copy_meshes,
+                is_symlink_copy=args.symlink_copy
+            )
+        logger.info("MJCF mesh post-processing finished successfully.")
+    except Exception as e:
+        logger.error("MJCF mesh post-processing failed: %s", e, exc_info=True)
         sys.exit(1)
 
     # Summary
