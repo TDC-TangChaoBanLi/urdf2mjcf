@@ -24,9 +24,11 @@ import sys
 from pathlib import Path
 from typing import Optional
 
+from .mesh_coacd import mesh_coacd
 from .mesh_converter import mesh_converter
 from .mesh_decomposer import mesh_decomposer
 from .mjcf_generator import mjcf_generator
+from .resource_registry import ResourceRegistry
 from .urdf_parser import UrdfParser
 
 # Logger for this module
@@ -217,6 +219,9 @@ def main() -> None:
 
     total_steps = 4
 
+    # Resource registry：登记本流程创建的文件，MJCF 写完后统一清理未引用产物。
+    registry = ResourceRegistry()
+
     log_step_header(1, total_steps, "Parse URDF")
     try:
         urdf_model = UrdfParser.parse_urdf(input_path)
@@ -225,45 +230,62 @@ def main() -> None:
         logger.error("URDF parsing failed: %s", e, exc_info=True)
         sys.exit(1)
 
-    log_step_header(2, total_steps, "Convert meshes referenced in URDF")
+    log_step_header(2, total_steps, "Convert / copy meshes & textures referenced in URDF")
     try:
-        fixed_urdf_path = str(input_path.parent) + "/" + input_path.stem + "_fixed.urdf"
         mesh_converter(
-                urdf_model=urdf_model, 
-                output_path=fixed_urdf_path, 
-                meshes_dir=meshes_dir, 
-                is_copy_meshes=args.copy_meshes, 
-                is_symlink_copy=args.symlink_copy
-            )
+            urdf_model=urdf_model,
+            meshes_dir=meshes_dir,
+            json_path=args.json_config,
+            is_copy_meshes=args.copy_meshes,
+            is_symlink_copy=args.symlink_copy,
+            registry=registry,
+        )
         logger.info("Mesh conversion finished successfully.")
     except Exception as e:
         logger.error("Mesh conversion failed: %s", e, exc_info=True)
         sys.exit(1)
 
-    log_step_header(3, total_steps, "Generate MJCF from URDF")
+    log_step_header(3, total_steps, "Decompose multi-material OBJ meshes")
+    try:
+        mesh_decomposer(
+            urdf_model=urdf_model,
+            meshes_dir=meshes_dir,
+            registry=registry,
+            is_symlink_copy=args.symlink_copy,
+        )
+        logger.info("OBJ decomposition finished successfully.")
+    except Exception as e:
+        logger.error("OBJ decomposition failed: %s", e, exc_info=True)
+        sys.exit(1)
+
+    # 凸包分解（可选）：对 visual/collision 的 mesh 做 CoACD 并替换引用
+    if args.decompose in ("visual", "collision"):
+        logger.info("[Convex decomposition] target='%s'", args.decompose)
+        try:
+            mesh_coacd(
+                urdf_model=urdf_model,
+                meshes_dir=meshes_dir,
+                decompose_target=args.decompose,
+                config_path=args.json_config,
+                registry=registry,
+            )
+            logger.info("Convex decomposition finished successfully.")
+        except Exception as e:
+            logger.error("Convex decomposition failed: %s", e, exc_info=True)
+            sys.exit(1)
+
+    log_step_header(4, total_steps, "Generate MJCF from URDF")
     try:
         mjcf_generator(
-                urdf_model=urdf_model, 
-                mjcf_path=output_path, 
-                json_config_path=args.json_config
-            )
+            urdf_model=urdf_model,
+            mjcf_path=output_path,
+            json_config_path=args.json_config,
+            meshes_dir=meshes_dir,
+            registry=registry,
+        )
         logger.info("MJCF generation finished successfully.")
     except Exception as e:
         logger.error("MJCF generation failed: %s", e, exc_info=True)
-        sys.exit(1)
-
-    log_step_header(4, total_steps, "Post-process meshes in MJCF")
-    try:
-        mesh_decomposer(
-                xml_path=output_path,
-                decompose_target=args.decompose,
-                config_path=args.json_config,
-                is_copy_meshes=args.copy_meshes,
-                is_symlink_copy=args.symlink_copy
-            )
-        logger.info("MJCF mesh post-processing finished successfully.")
-    except Exception as e:
-        logger.error("MJCF mesh post-processing failed: %s", e, exc_info=True)
         sys.exit(1)
 
     # Summary

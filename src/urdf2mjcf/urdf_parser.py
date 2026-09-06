@@ -57,6 +57,9 @@ class UrdfParser:
     class UrdfMaterial:
         m_name: Optional[str] = None
         color_rgba: Optional[str] = None
+        # EN: filename of <material><texture .../> (raw URDF value, may be package:// etc.)
+        # CN: <material><texture .../> 的 filename（URDF 原文，可能为 package:// 等）
+        texture_file: Optional[str] = None
     
     @dataclass
     class UrdfVisual:
@@ -205,26 +208,34 @@ class UrdfParser:
                 return link
 
     @staticmethod
+    def _parse_material_elem(material_elem: ET.Element[str]) -> 'UrdfParser.UrdfMaterial':
+        """
+        解析一个 <material> 元素（含 <color> 与 <texture> 子元素）
+
+        URDF 允许：
+          <material name="...">
+            <color rgba="..."/>
+            <texture filename="package://.../gold.png"/>
+          </material>
+        """
+        m_name = material_elem.attrib.get("name", None)
+        rgba: Optional[str] = None
+        texture_file: Optional[str] = None
+        color_elem = material_elem.find("color")
+        if color_elem is not None:
+            rgba = color_elem.attrib.get("rgba", None)
+        texture_elem = material_elem.find("texture")
+        if texture_elem is not None:
+            texture_file = texture_elem.attrib.get("filename", None)
+        return UrdfParser.UrdfMaterial(m_name=m_name, color_rgba=rgba, texture_file=texture_file)
+
+    @staticmethod
     def _parse_materials(robot_elem: ET.Element[str]) -> List[UrdfParser.UrdfMaterial]:
-        """解析 material 标签，返回 Material 对象"""
+        """解析 robot 根级 material 标签，返回 Material 对象"""
         materials: List[UrdfParser.UrdfMaterial] = []
         # root materials
         for material_elem in robot_elem.findall("material"):
-            m_name = material_elem.attrib.get("name", "")
-            color_elem = material_elem.find("color")
-            rgba = color_elem.attrib.get("rgba", "") if color_elem is not None else ""
-            # materials[m_name] = rgba
-            materials.append(UrdfParser.UrdfMaterial(m_name=m_name, color_rgba=rgba))
-        # link visual materials
-        # for link_elem in robot_elem.findall("link"):
-        #     for visual_elem in link_elem.findall("visual"):
-        #         material_elem = visual_elem.find("material")
-        #         if material_elem is not None:
-        #             m_name = material_elem.attrib.get("name", "")
-        #             if m_name not in materials: # 避免重复
-        #                 color_elem = material_elem.find("color")
-        #                 rgba = color_elem.attrib.get("rgba", "") if color_elem is not None else ""
-        #                 materials[m_name] = rgba
+            materials.append(UrdfParser._parse_material_elem(material_elem))
         return materials
 
     @staticmethod
@@ -301,15 +312,9 @@ class UrdfParser:
                     geometry_elem = visual_elem.find("geometry") # get all geometry elements
                     geometry = UrdfParser._get_geometrys(geometry_elem) # add geometrys
                     # 解析 material
-                    material_name: Optional[str] = None
-                    material_color_rgba: Optional[str] = None
                     material_elem = visual_elem.find("material") # visual element has only one material element
                     if material_elem is not None:
-                        material_name = material_elem.attrib.get("name", None)
-                        material_color_elem = material_elem.find("color")
-                        if material_color_elem is not None:
-                            material_color_rgba = material_color_elem.attrib.get("rgba", None)
-                        link__visual_material = UrdfParser.UrdfMaterial(m_name=material_name, color_rgba=material_color_rgba)
+                        link__visual_material = UrdfParser._parse_material_elem(material_elem)
                     else: 
                         link__visual_material = None
                     # 写入 visual 信息
@@ -327,15 +332,9 @@ class UrdfParser:
                     geometry_elem = collision_elem.find("geometry") # get all geometry elements
                     geometry = UrdfParser._get_geometrys(geometry_elem) # extend geometrys list
                     # 解析 material
-                    material_name: Optional[str] = None
-                    material_color_rgba: Optional[str] = None
                     material_elem = collision_elem.find("material") # collision element has only one material element
                     if material_elem is not None:
-                        material_name = material_elem.attrib.get("name", None)
-                        material_color_elem = material_elem.find("color")
-                        if material_color_elem is not None:
-                            material_color_rgba = material_color_elem.attrib.get("rgba", None)
-                        link__visual_material = UrdfParser.UrdfMaterial(m_name=material_name, color_rgba=material_color_rgba)
+                        link__visual_material = UrdfParser._parse_material_elem(material_elem)
                     else: 
                         link__visual_material = None
                     # 写入 collision 信息

@@ -5,8 +5,10 @@ assets into formats usable by MuJoCo (MJCF). It provides a CLI entry point
 and utilities for:
 
 - Normalizing and converting mesh files (DAE → OBJ, others → STL)
+- Fixing ASCII STL → binary STL (MuJoCo only supports binary STL)
 - Optionally copying or linking mesh assets into a dedicated directory
-- Splitting multi-material OBJ files and extracting simple material colors
+- Splitting multi-material OBJ files and extracting colors / textures (MTL map_Kd)
+- Extracting URDF `<material><texture>` textures into the meshes directory
 - Optionally running convex decomposition via CoACD (when available)
 
 This package exposes a `urdf2mjcf` console script .
@@ -65,8 +67,6 @@ JSON config file example:
             "add_json_sensor":      true,
             "add_json_camera":      true,
 
-            "add_json_texture":   true,
-
             "add_default_contact": true,
             "add_json_contact": true
         },
@@ -123,14 +123,6 @@ JSON config file example:
                 {"name": "realsense_link_CAMERA", "mode": "fixed", "pos": "0 0 0", "euler": "0 -1.5708 -1.5708", "fovy": "75", "resolution": "640 480" }
             ]
         },
-        "texture": {
-            "cube_A_link": [
-                {"name": "cube_A_link_TEXTURE", "file": "../assets/tag36h11-100.png", "pos": "0.0 0.0 0.025", "euler": "0.0 0.0 0.0", "size": "0.05 0.05"}
-            ],
-            "cube_B_link": [
-                {"name": "cube_B_link_TEXTURE", "file": "../assets/tag36h11-101.png", "pos": "0.0 0.0 0.025", "euler": "0.0 0.0 0.0", "size": "0.05 0.05"}
-            ]
-        },
         "gravcomp":{
             "add_gravcomp": false,          // 设为 true 则为全部 body 开启重力补偿；也可用列表指定 body: ["body_1", "body_2"]
             "add_actuatorgravcomp": false   // 设为 true 则为全部 joint 开启控制力重力补偿；也可用列表指定 joint: ["joint_1", "joint_2"]
@@ -150,10 +142,14 @@ JSON config file example:
 ```
 src/urdf2mjcf/
 ├── __init__.py              # Main package entry
-├── cli.py                   # Command-line interface
-├── mesh_converter.py        # Core mesh conversion logic
+├── cli.py                   # Command-line interface (pipeline orchestration)
+├── urdf_parser.py           # URDF parsing (link/joint/mesh/material/texture)
+├── mesh_converter.py        # Mesh copy/symlink/format conversion / ASCII-STL fix / URDF texture landing
+├── mesh_decomposer.py       # Multi-material OBJ decomposition (model level)
+├── mesh_coacd.py            # Convex decomposition via CoACD (optional)
+├── mesh_utils.py            # Shared mesh/texture utilities
+├── resource_registry.py     # Resource registry & post-MJCF cleanup
 ├── mjcf_generator.py        # URDF to MJCF conversion
-├── mesh_decomposer.py       # OBJ post-processing and decomposition
 └── py.typed                 # Type hints marker
 
 pyproject.toml               # Project metadata and dependencies
@@ -169,6 +165,10 @@ LICENSE                      # MIT License
 
 - DAE/other formats → OBJ (preserving materials where possible)
 - DAE/other formats → STL (for collision meshes)
+- ASCII STL → binary STL (MuJoCo compatible)
+- Textures: from URDF `<material><texture>` or from the mesh itself (OBJ/MTL map_Kd etc.)
+- Intermediate files from conversion/splitting/convex decomposition are tracked by a
+  ResourceRegistry and cleaned up automatically after the MJCF is written
 - Automatic MTL file renaming and fixing
 - Separate subdirectory per mesh (avoiding MTL conflicts)
 - File content hashing for deduplication

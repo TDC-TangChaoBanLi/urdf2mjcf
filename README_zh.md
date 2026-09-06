@@ -5,8 +5,10 @@
 主要功能：
 
 - 标准化并转换 mesh（例如 DAE → OBJ，其他格式 → STL）
+- ASCII STL → 二进制 STL 修复（MuJoCo 仅支持二进制 STL）
 - 可选地将 mesh 复制或创建链接到指定目录
-- 按材质分解多材质 OBJ 并提取简单材质颜色
+- 按材质分解多材质 OBJ 并提取颜色/贴图（MTL map_Kd）
+- 提取 URDF `<material><texture>` 贴图并落地到 meshes 目录
 - 在安装 CoACD 时可选择进行凸包分解
 
 提供命令行工具 `urdf2mjcf` 。
@@ -65,8 +67,6 @@ JSON 配置文件示例:
             "add_json_sensor":      true,
             "add_json_camera":      true,
 
-            "add_json_texture":   true,
-
             "add_default_contact": true,
             "add_json_contact": true
         },
@@ -123,14 +123,6 @@ JSON 配置文件示例:
                 {"name": "realsense_link_CAMERA", "mode": "fixed", "pos": "0 0 0", "euler": "0 -1.5708 -1.5708", "fovy": "75", "resolution": "640 480" }
             ]
         },
-        "texture": {
-            "cube_A_link": [
-                {"name": "cube_A_link_TEXTURE", "file": "../assets/tag36h11-100.png", "pos": "0.0 0.0 0.025", "euler": "0.0 0.0 0.0", "size": "0.05 0.05"}
-            ],
-            "cube_B_link": [
-                {"name": "cube_B_link_TEXTURE", "file": "../assets/tag36h11-101.png", "pos": "0.0 0.0 0.025", "euler": "0.0 0.0 0.0", "size": "0.05 0.05"}
-            ]
-        },
         "gravcomp":{
             "add_gravcomp": false,          // 设为 true 则为全部 body 开启重力补偿；也可用列表指定 body: ["body_1", "body_2"]
             "add_actuatorgravcomp": false   // 设为 true 则为全部 joint 开启控制力重力补偿；也可用列表指定 joint: ["joint_1", "joint_2"]
@@ -150,10 +142,14 @@ JSON 配置文件示例:
 ```
 src/urdf2mjcf/
 ├── __init__.py              # 包入口
-├── cli.py                   # 命令行界面
-├── mesh_converter.py        # 核心 mesh 转换逻辑
+├── cli.py                   # 命令行界面（流程编排）
+├── urdf_parser.py           # URDF 解析（link/joint/mesh/material/texture）
+├── mesh_converter.py        # mesh 复制/软链/格式转换/ASCII-STL 修复/URDF 贴图落地
+├── mesh_decomposer.py       # 多材质 OBJ 分解（model 级）
+├── mesh_coacd.py            # 凸包分解（CoACD，可选）
+├── mesh_utils.py            # 公共 mesh/texture 工具
+├── resource_registry.py     # 资源登记与写 MJCF 后统一清理
 ├── mjcf_generator.py        # URDF 到 MJCF 转换
-├── mesh_decomposer.py       # OBJ 后处理和分解
 └── py.typed                 # 类型提示标记
 
 pyproject.toml               # 项目元数据和依赖
@@ -169,6 +165,9 @@ LICENSE                      # MIT 许可证
 
 - DAE/其他格式 → OBJ（保留材质）
 - DAE/其他格式 → STL（用于碰撞网格）
+- ASCII STL → 二进制 STL（MuJoCo 兼容）
+- 贴图：URDF `<material><texture>` 或 mesh 自带（OBJ/MTL map_Kd 等）
+- 转换/拆分/凸包的中间文件由 ResourceRegistry 登记，写 MJCF 后自动清理
 - 自动 MTL 文件重命名和修复
 - 每个 mesh 独立子目录（避免 MTL 冲突）
 - 基于内容的 mesh 去重和硬链接支持

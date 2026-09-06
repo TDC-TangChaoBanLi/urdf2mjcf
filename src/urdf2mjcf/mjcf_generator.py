@@ -333,7 +333,9 @@ class MjcfConfig:
 
 
     cameras: List[Dict[str, Any]] = field(default_factory=list)
-    textures: List[Dict[str, Any]] = field(default_factory=list)
+    # NOTE: JSON 平面贴图（向 body 附加纹理面片）功能已移除：
+    # 贴图仅来自 URDF <material><texture> 与 mesh 自带（OBJ/MTL map_Kd 等）。
+    # 故不再维护 textures 字段。environment texture（floor/skybox）不受影响。
 
 
     @staticmethod
@@ -390,7 +392,8 @@ class MjcfConfig:
             logger_json.error(f"JSON config root is not a dict: {p}")
             root = {}
         elif mjcf_config_key not in raw:
-            logger_json.error(f"JSON config missing '{mjcf_config_key}' dict: {p}")
+            # 可能 JSON 只含 mesh_converter（package_map）等其它段
+            logger_json.debug(f"JSON config has no '{mjcf_config_key}' section; using built-in defaults: {p}")
             root = {}
         elif not isinstance(raw[mjcf_config_key], dict):
             logger_json.error(f"JSON config missing '{mjcf_config_key}' dict: {p}")
@@ -444,15 +447,11 @@ class MjcfConfig:
         cameras_json = cls._cfg_get(root, "camera", {}) or {}
         cls.cameras = cls._load_labeled_config_list(cameras_json)
 
-        textures_json = cls._cfg_get(root, "texture", {}) or {}
-        cls.textures = cls._load_labeled_config_list(textures_json)
-
         logger_json.info(
-            "Loaded JSON config: actuators=%d, sensors=%d, cameras=%d, textures=%d, contacts=%d, equalitys=%d",
+            "Loaded JSON config: actuators=%d, sensors=%d, cameras=%d, contacts=%d, equalitys=%d",
             len(cls.actuators),
             len(cls.sensors),
             len(cls.cameras),
-            len(cls.textures),
             len(cls.contacts),
             len(cls.equalities),
         )
@@ -468,10 +467,15 @@ class MjcfBuilder:
     CN: MJCF 构建器：生成 asset/worldbody/actuator/sensor 等块。
     """
 
-    def __init__(self, model_name: str, json_cfg: MjcfConfig, urdf_model: UrdfParser, mjcf_path: Path):
+    def __init__(self, model_name: str, json_cfg: MjcfConfig, urdf_model: UrdfParser, mjcf_path: Path,
+                 meshes_dir: Optional[Union[str, Path]] = None, registry=None):
         self.json_cfg = json_cfg
         self.urdf_model = urdf_model
         self.mjcf_path = mjcf_path
+        # EN: meshes directory (all mesh/texture assets are expected to live here).
+        # CN: mesh 目录（所有 mesh/texture asset 均预期位于此目录）。
+        self.meshes_dir: Path = Path(meshes_dir) if meshes_dir is not None else Path(mjcf_path).parent / "meshes"
+        self.registry = registry  # Optional ResourceRegistry for final cleanup
 
         self.root = ET.Element("mujoco", attrib={"model": model_name})
         self.compiler = ET.SubElement(self.root, "compiler")
@@ -484,6 +488,10 @@ class MjcfBuilder:
         self.actuator = ET.SubElement(self.root, "actuator")
         self.equality = ET.SubElement(self.root, "equality")
         self.sensor = ET.SubElement(self.root, "sensor")
+
+        # EN: already-added material names (deduplication for URDF materials).
+        # CN: 已添加的 material 名称（URDF material 去重）。
+        self._added_material_names: set = set()
 
 
     # -------------------------
@@ -810,63 +818,6 @@ class MjcfBuilder:
         logger_mjcf.debug(f"Added camera from json: {len(json_camera)} cameras")
         return add_num
 
-    def add_json_texture(self) -> int:
-        """
-        添加 json 文件中的 texture 配置
-        
-        """
-        add_num = 0
-        json_texture = self.json_cfg.textures or []
-        for config in json_texture:
-            parent_body_name = config.get("label")
-            texture_name = config.get("name")
-            texture_file = config.get("file")
-            texture_geom_pos = config.get("pos")
-            texture_geom_quat = config.get("quat")
-            texture_geom_euler = config.get("euler")
-            texture_geom_size = config.get("size")
-
-            if texture_name is None:
-                logger_mjcf.error(f"The texture 'name' is None when add texture. body name: {parent_body_name}")
-                continue
-            if texture_file is None:
-                logger_mjcf.error(f"The texture 'file' is None when add texture. texture name: {texture_name}")
-                continue
-            if texture_geom_size is None:
-                logger_mjcf.error(f"The texture 'size' is None when add texture. texture name: {texture_name}")
-                continue
-            if texture_geom_pos is None:
-                logger_mjcf.warning(f"The texture 'pos' is None when add texture. texture name: {texture_name}")
-                continue
-            if texture_geom_quat is None and texture_geom_euler is None:
-                logger_mjcf.warning(f"The texture 'quat' and 'euler' is None when add texture. texture name: {texture_name}")
-                continue
-            if texture_geom_quat is not None and texture_geom_euler is not None:
-                logger_mjcf.error(f"The texture has both 'quat' and 'euler' when add texture. texture name: {texture_name}")
-                continue
-            
-            ET.SubElement(self.asset, "texture", attrib={"name": texture_name, "file": texture_file, "type": "2d"})
-            ET.SubElement(self.asset, "material", attrib={"name": texture_name, "texture": texture_name})
-            parent_body = MjcfBuilder.__find_body_by_name(self.worldbody, parent_body_name)
-            texture_body_attribs = {
-                "class": "visual",
-                "name": texture_name,
-                "type": "box",
-                "size": _vec2str(x/2.0 for x in _str2vec(texture_geom_size))+" 1e-5",
-                "material": texture_name,
-            }
-            if texture_geom_pos is not None:
-                texture_body_attribs["pos"] = texture_geom_pos
-            if texture_geom_quat is not None:
-                texture_body_attribs["quat"] = texture_geom_quat
-            elif texture_geom_euler is not None:
-                texture_body_attribs["euler"] = texture_geom_euler
-            MjcfBuilder._add_geom(body=parent_body, attribs=texture_body_attribs)
-            add_num += 1
-            logger_mjcf.debug(f"Added texture to {parent_body_name} from json. texture name: {texture_name}")
-        return add_num
-
-
     def add_json_customize(self) -> int:
         """
         添加 json 文件中的 customize 配置
@@ -934,19 +885,102 @@ class MjcfBuilder:
                 add_num += 1
         return add_num
 
+    def _resolve_asset_relpath(self, abs_path: Union[str, Path]) -> str:
+        """
+        将绝对路径转为相对 MJCF 输出目录的相对路径（供 asset file 属性使用）。
+        """
+        abs_path = Path(os.path.abspath(abs_path))
+        mjcf_dir = Path(self.mjcf_path).parent.resolve()
+        try:
+            return os.path.relpath(str(abs_path), str(mjcf_dir))
+        except ValueError:
+            return str(abs_path)
+
+    def _ensure_texture_and_material(self, material: "UrdfParser.UrdfMaterial") -> Optional[str]:
+        """
+        为带贴图的 URDF material 生成 <texture> + <material> asset，返回 material 名。
+
+        - texture 优先（file 指向已落地 meshes_dir 的贴图，相对 MJCF 路径）
+        - rgba 作 tint（若 color_rgba 存在）
+        - 同名查重；仅首个带同名贴图的 material 生成 asset
+        - 若传入 material 仅含 name 引用（URDF visual 常见写法），
+          回查根级 <robot><material> 定义以补全 color/texture。
+        """
+        # 仅 name 引用 -> 补全根级定义
+        if material.m_name and material.color_rgba is None and material.texture_file is None:
+            for root_mat in self.urdf_model.materials:
+                if root_mat.m_name == material.m_name:
+                    material = root_mat
+                    break
+
+        if material.m_name:
+            if material.m_name in self._added_material_names:
+                return material.m_name
+        # 生成材质名
+        if material.m_name:
+            mat_xml_name = material.m_name
+        else:
+            # 无名称：以贴图文件名生成
+            if material.texture_file:
+                stem = Path(material.texture_file).stem
+                mat_xml_name = f"material_{stem}"
+            else:
+                mat_xml_name = "material_default"
+
+        # 贴图路径 -> 相对 MJCF 的 file
+        tex_abs = material.texture_file
+        tex_attr: Optional[str] = None
+        if tex_abs:
+            p = Path(tex_abs)
+            if p.is_file():
+                tex_attr = self._resolve_asset_relpath(p)
+            else:
+                logger_mjcf.warning(f"Texture file not found: {tex_abs}; material '{mat_xml_name}' uses rgba only.")
+
+        rgba_attr = material.color_rgba or "1 1 1 1"
+
+        # texture asset（查重：同一文件只添加一个 texture asset）
+        if tex_attr is not None:
+            existing = [t for t in self.asset.findall("texture") if t.get("file") == tex_attr]
+            if existing:
+                tex_xml_name = existing[0].get("name")
+            else:
+                tex_xml_name = f"{mat_xml_name}_TEX"
+                # 避免名字与已有 texture 冲突
+                i = 1
+                base = tex_xml_name
+                while any(t.get("name") == tex_xml_name for t in self.asset.findall("texture")):
+                    tex_xml_name = f"{base}_{i}"
+                    i += 1
+                ET.SubElement(self.asset, "texture", attrib={"name": tex_xml_name, "file": tex_attr, "type": "2d"})
+                logger_mjcf.debug(f"Added texture asset from urdf: name={tex_xml_name} file={tex_attr}")
+
+        # material asset（查重）
+        if mat_xml_name not in self._added_material_names:
+            attr = {"name": mat_xml_name, "rgba": rgba_attr}
+            if tex_attr is not None:
+                attr["texture"] = tex_xml_name
+            ET.SubElement(self.asset, "material", attr)
+            self._added_material_names.add(mat_xml_name)
+            logger_mjcf.debug(f"Added material asset from urdf: name={mat_xml_name} texture={tex_xml_name if tex_attr else None}")
+        return mat_xml_name
+
     def add_urdf_material(self) -> int:
         """
-        添加 urdf 文件中的 material 信息
+        添加 urdf 文件中的 material 信息（支持根级 material，含贴图）。
+
+        根级 material 大多被 link 的 visual/collision 以 name 引用；
+        若引用处本身内嵌了完整 material（含 texture），则由 _build_body 生成。
         """
         add_num = 0
         for material in self.urdf_model.materials:
-            attraib = {
-                "name": material.m_name or "unkonwn_material",
-                "rgba": material.color_rgba or "1 1 1 1",
-            }
-            ET.SubElement(self.asset, "material", attraib)
-            add_num += 1
-            logger_mjcf.debug(f"Added material from urdf: material name{material}")
+            if material.m_name in self._added_material_names:
+                continue
+            # 若该材质名在后续 visual 中被内嵌引用，可能在 build 阶段已生成，
+            # 这里查重后生成（幂等）
+            name = self._ensure_texture_and_material(material)
+            if name:
+                add_num += 1
         return add_num
 
     def add_urdf_contact(self) -> int:
@@ -1150,8 +1184,7 @@ class MjcfBuilder:
         return sub_elem
         
 
-    @staticmethod
-    def _build_body(parent: ET.Element[str], link: UrdfParser.UrdfLink, joint:Optional[UrdfParser.UrdfJoint],  asset:ET.Element[str], urdf_file_path: Path = None, mjcf_output_path: Path = None, gravcomp_config: Optional[Dict[str, Any]] = None) -> Optional[ET.Element[str]]:
+    def _build_body(self, parent: ET.Element[str], link: UrdfParser.UrdfLink, joint:Optional[UrdfParser.UrdfJoint],  asset:ET.Element[str], urdf_file_path: Path = None, mjcf_output_path: Path = None, gravcomp_config: Optional[Dict[str, Any]] = None) -> Optional[ET.Element[str]]:
         """
         构建 body 节点
         
@@ -1251,11 +1284,12 @@ class MjcfBuilder:
                     "pos": collision.origin.xyz,
                     "quat": _vec2str(_rpy_to_quaternion(_str2vec(collision.origin.rpy))),
                 }
+                # 碰撞体颜色不影响仿真；有材质名则引用材质 asset，否则直接 rgba
                 if collision.material is not None:
-                    if collision.material.color_rgba is not None:
-                        collision_geom_attribs["rgba"] = collision.material.color_rgba
-                    elif collision.material.m_name is not None:
+                    if collision.material.m_name is not None:
                         collision_geom_attribs["material"] = collision.material.m_name
+                    elif collision.material.color_rgba is not None:
+                        collision_geom_attribs["rgba"] = collision.material.color_rgba
                 if collision.geometry.g_type == "mesh":
                     mesh_name = "MESH_" + collision.geometry.filename.split("/")[-1].split(".")[0] # 文件名不带扩展名
                     if urdf_file_path and mjcf_output_path:
@@ -1265,6 +1299,9 @@ class MjcfBuilder:
                     mesh_attribs: Dict[str, Any] = {"name": mesh_name, "file": mesh_file_path}
                     if collision.geometry.scale:
                         mesh_attribs["scale"] = collision.geometry.scale
+                    # OBJ 常为薄壳/面片，体积为 0：使用 inertia="shell" 避免编译失败
+                    if str(mesh_file_path).lower().endswith(".obj"):
+                        mesh_attribs.setdefault("inertia", "shell")
                     MjcfBuilder._add_mesh(asset=asset, attribs=mesh_attribs)
                     collision_geom_attribs["mesh"] = mesh_name
                 elif collision.geometry.g_type == "box":
@@ -1287,11 +1324,17 @@ class MjcfBuilder:
                     "pos": visual.origin.xyz,
                     "quat": _vec2str(_rpy_to_quaternion(_str2vec(visual.origin.rpy))),
                 }
+                # visual 材质处理：
+                # - 有 m_name 或 texture：通过 <material> asset 引用（保证 asset 存在）
+                # - 否则纯色写 geom rgba
                 if visual.material is not None:
-                    if visual.material.color_rgba is not None:
-                        visual_geom_attribs["rgba"] = visual.material.color_rgba
-                    elif visual.material.m_name is not None:
-                        visual_geom_attribs["material"] = visual.material.m_name
+                    m = visual.material
+                    if m.m_name is not None or m.texture_file is not None:
+                        mat_name = self._ensure_texture_and_material(m)
+                        if mat_name is not None:
+                            visual_geom_attribs["material"] = mat_name
+                    elif m.color_rgba is not None:
+                        visual_geom_attribs["rgba"] = m.color_rgba
                 if visual.geometry.g_type == "mesh":
                     mesh_name = "MESH_" + visual.geometry.filename.split("/")[-1].split(".")[0] # 文件名不带扩展名
                     if urdf_file_path and mjcf_output_path:
@@ -1301,6 +1344,9 @@ class MjcfBuilder:
                     mesh_attribs: Dict[str, Any] = {"name": mesh_name, "file": mesh_file_path}
                     if visual.geometry.scale:
                         mesh_attribs["scale"] = visual.geometry.scale
+                    # OBJ 常为薄壳/面片，体积为 0：使用 inertia="shell" 避免编译失败
+                    if str(mesh_file_path).lower().endswith(".obj"):
+                        mesh_attribs.setdefault("inertia", "shell")
                     MjcfBuilder._add_mesh(asset=asset, attribs=mesh_attribs)
                     visual_geom_attribs["mesh"] = mesh_name
                 elif visual.geometry.g_type == "box":
@@ -1320,9 +1366,17 @@ class MjcfBuilder:
         """
         gravcomp_config = self.json_cfg.gravcomp if self.json_cfg.gravcomp else None
 
-        root_name = self.urdf_model.root_link
+        # 无 joint 的 URDF 可能没有推导出 root_link，兜底取第一个 link
+        root_name = self.urdf_model.root_link or (self.urdf_model.links[0].l_name if self.urdf_model.links else None)
+        if root_name is None:
+            logger_mjcf.error("URDF model has no links; cannot build worldbody.")
+            return self.worldbody
         # get the UrdfLink named child_name
-        urdf_link = list(filter(lambda link: link.l_name == root_name, self.urdf_model.links))[0]
+        root_links = [link for link in self.urdf_model.links if link.l_name == root_name]
+        if not root_links:
+            logger_mjcf.error(f"Root link '{root_name}' not found in model links.")
+            return self.worldbody
+        urdf_link = root_links[0]
         # get the UrdfJoints which are parented to child_name
         urdf_joint = list(filter(lambda joint: joint.child == root_name, self.urdf_model.joints))
         if len(urdf_joint) > 0:
@@ -1330,7 +1384,7 @@ class MjcfBuilder:
         else:
             urdf_joint = None
         # build the root body to worldbody
-        root_body: ET.Element[str] = MjcfBuilder._build_body(self.worldbody, urdf_link, urdf_joint, asset=self.asset, 
+        root_body: ET.Element[str] = self._build_body(self.worldbody, urdf_link, urdf_joint, asset=self.asset, 
                                                             urdf_file_path=self.urdf_model.urdf_file_path, 
                                                             mjcf_output_path=self.mjcf_path,
                                                             gravcomp_config=gravcomp_config)
@@ -1351,7 +1405,7 @@ class MjcfBuilder:
                     else:
                         urdf_joint = None
 
-                    body = MjcfBuilder._build_body(parent_elem, urdf_link, urdf_joint, asset=self.asset, 
+                    body = self._build_body(parent_elem, urdf_link, urdf_joint, asset=self.asset, 
                                                    urdf_file_path=self.urdf_model.urdf_file_path, 
                                                    mjcf_output_path=self.mjcf_path,
                                                    gravcomp_config=gravcomp_config)
@@ -1388,14 +1442,45 @@ class MjcfBuilder:
 # Public interface
 # 对外接口
 # =============================================================================
+def _collect_asset_files(root: ET.Element, mjcf_path: Union[str, Path]) -> List[Path]:
+    """
+    EN: Collect all asset files referenced by the final MJCF (absolute paths):
+        <asset><mesh file> and <asset><texture file>.
+    CN: 收集最终 MJCF 引用的所有 asset 文件（绝对路径）：
+        <asset><mesh file> 与 <asset><texture file>。
+    """
+    mjcf_dir = Path(mjcf_path).parent
+    used: List[Path] = []
+    assets = root.find("asset")
+    if assets is None:
+        return used
+    for child in assets:
+        if child.tag not in ("mesh", "texture"):
+            continue
+        file_attr = child.get("file")
+        if not file_attr:
+            continue
+        p = Path(file_attr)
+        if p.is_absolute():
+            used.append(p)
+        else:
+            used.append((mjcf_dir / p).resolve())
+    return used
+
+
 def mjcf_generator(
     urdf_model: UrdfParser,
     mjcf_path: Union[str, Path],
     json_config_path: Optional[Union[str, Path]] = None,
+    meshes_dir: Optional[Union[str, Path]] = None,
+    registry=None,
 ) -> None:
     """
     EN: Convert URDF to MJCF.
     CN: 将 URDF 转换为 MJCF。
+
+    :param meshes_dir: EN meshes directory (for asset relpath computation) CN mesh 目录
+    :param registry: EN ResourceRegistry for post-write cleanup CN 资源登记表（写后清理）
     """
 
     mjcf_path = Path(mjcf_path)
@@ -1404,7 +1489,14 @@ def mjcf_generator(
     cfg = MjcfConfig.load(json_config_path)
     model = urdf_model
 
-    builder = MjcfBuilder(model_name=model.robot_name, json_cfg=cfg, urdf_model=model, mjcf_path=mjcf_path)
+    builder = MjcfBuilder(
+        model_name=model.robot_name,
+        json_cfg=cfg,
+        urdf_model=model,
+        mjcf_path=mjcf_path,
+        meshes_dir=meshes_dir,
+        registry=registry,
+    )
 
     builder.build_worldbody_from_urdf()
 
@@ -1455,8 +1547,6 @@ def mjcf_generator(
         is_add_json_light = builder.add_json_light()
     if bool(config_cfg.get("add_json_camera", False)):
         is_add_json_camera = builder.add_json_camera()
-    if bool(config_cfg.get("add_json_texture", False)):
-        is_add_json_texture = builder.add_json_texture()
     if bool(config_cfg.get("add_json_customize", False)):
         is_add_json_customize = builder.add_json_customize()
     if bool(worldbody_cfg.get("add_json_floor", False)):
@@ -1490,6 +1580,16 @@ def mjcf_generator(
 
     _pretty_write_xml(builder.root, mjcf_path)
     logger.info("Saved MJCF: %s", str(mjcf_path))
+
+    # ------------------------------------------------------------------
+    # 写后统一清理：收集最终 MJCF 引用的所有文件（mesh/texture），
+    # 删除 ResourceRegistry 中登记的、未被引用的中间产物。
+    # ------------------------------------------------------------------
+    if registry is not None:
+        used = _collect_asset_files(builder.root, mjcf_path)
+        removed = registry.finalize(used)
+        if removed:
+            logger.info("Cleaned up %d unused intermediate resource file(s).", removed)
 
 
 if __name__ == "__main__":
