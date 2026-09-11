@@ -302,6 +302,56 @@ def _rpy_to_quaternion(rpy: tuple, degrees=False) -> tuple:
     return (qw / norm, qx / norm, qy / norm, qz / norm)
 
 
+def _quat_normalize(q) -> tuple:
+    """
+    EN: Normalize a quaternion (w, x, y, z); falls back to identity.
+    CN: 归一化四元数 (w, x, y, z)，退化时返回单位四元数。
+    """
+    w, x, y, z = (float(v) for v in q)
+    n = math.sqrt(w * w + x * x + y * y + z * z)
+    if n < 1e-12:
+        return (1.0, 0.0, 0.0, 0.0)
+    return (w / n, x / n, y / n, z / n)
+
+
+def _quat_mul(a, b) -> tuple:
+    """
+    EN: Hamilton product of two (w, x, y, z) quaternions.
+    CN: 两个 (w, x, y, z) 四元数的 Hamilton 乘积。
+    """
+    aw, ax, ay, az = a
+    bw, bx, by, bz = b
+    return (
+        aw * bw - ax * bx - ay * by - az * bz,
+        aw * bx + ax * bw + ay * bz - az * by,
+        aw * by - ax * bz + ay * bw + az * bx,
+        aw * bz + ax * by - ay * bx + az * bw,
+    )
+
+
+def _quat_rotate(q, v) -> tuple:
+    """
+    EN: Rotate a 3-vector by a (w, x, y, z) quaternion.
+    CN: 用 (w, x, y, z) 四元数旋转三维向量。
+    """
+    w, x, y, z = q
+    qv = (x, y, z)
+
+    def _cross(a, b):
+        return (
+            a[1] * b[2] - a[2] * b[1],
+            a[2] * b[0] - a[0] * b[2],
+            a[0] * b[1] - a[1] * b[0],
+        )
+
+    t = _cross(qv, v)
+    t = tuple(2.0 * w * ti for ti in t)
+    u = _cross(qv, _cross(qv, v))
+    u = tuple(2.0 * ui for ui in u)
+    return tuple(float(v[i]) + t[i] + u[i] for i in range(3))
+
+
+
 # =============================================================================
 # Config (JSON)
 # JSON 配置
@@ -764,6 +814,64 @@ class MjcfBuilder:
         return None
     
     @staticmethod
+    def __find_body_with_parent(parent: ET.Element[str], name: str) -> Tuple[Optional[ET.Element[str]], Optional[ET.Element[str]]]:
+        """
+        递归查找指定名称的 body，同时返回其父元素（ElementTree 没有父指针）。
+
+        :param parent: 搜索起点（body 或 worldbody 元素）
+        :param name: 目标 body 名称
+        :return: (父元素, body 元素)；未找到时返回 (None, None)
+        """
+        for child in list(parent):
+            if child.tag != "body":
+                continue
+            if child.attrib.get("name") == name:
+                return parent, child
+            found_parent, found_body = MjcfBuilder.__find_body_with_parent(child, name)
+            if found_body is not None:
+                return found_parent, found_body
+        return None, None
+
+    @staticmethod
+    def __accumulate_world_pose(root: ET.Element[str], target: ET.Element[str]) -> Tuple[Optional[Tuple], Optional[Tuple]]:
+        """
+        计算 target body 相对于 root（通常是 worldbody，即世界系）的位姿。
+
+        沿 root -> target 的父子链依次右乘各 body 的 (pos, quat)。
+
+        :return: ((x, y, z), (w, x, y, z))；target 不在 root 子树内时返回 (None, None)
+        """
+        # 深度优先找出 root -> target 的 body 路径
+        path: List[ET.Element[str]] = []
+
+        def _dfs(node: ET.Element[str]) -> bool:
+            if node is target:
+                return True
+            for child in list(node):
+                if child.tag != "body":
+                    continue
+                if _dfs(child):
+                    path.insert(0, child)
+                    return True
+            return False
+
+        if not _dfs(root):
+            return None, None
+
+        pos = (0.0, 0.0, 0.0)
+        quat = (1.0, 0.0, 0.0, 0.0)
+        for body in path:
+            local_pos = _str2vec(body.attrib.get("pos"))
+            if body.attrib.get("quat") is not None:
+                local_quat = _quat_normalize(_str2vec(body.attrib.get("quat")))
+            else:
+                local_quat = (1.0, 0.0, 0.0, 0.0)
+            rotated = _quat_rotate(quat, local_pos)
+            pos = tuple(pos[i] + rotated[i] for i in range(3))
+            quat = _quat_mul(quat, local_quat)
+        return pos, quat
+
+    @staticmethod
     def __add_json_list_configs_body(worldbody: ET.Element[str], configs_list: List[Dict[str, Any]], label: str) -> int:
         """
         添加 json 文件中的列表配置
@@ -870,19 +978,49 @@ class MjcfBuilder:
     def add_json_worldbody_freejoint(self) -> int:
         """
         添加 json 文件中的 freejoint 配置
-        
+
+        `worldbody.freejoint_body` 中列出的 body 会被赋予一个 freejoint（6 自由度自由
+        漂浮）。MuJoCo 的 freejoint 只能作用于 body 相对其父节点的自由度，因此这里支持
+        **嵌套 body 的“提升”**：
+
+          * 若目标 body 已经是 worldbody 的直接子节点 —— 直接添加 freejoint；
+          * 否则 —— 先把父链上的 pos/quat 累积成该 body 在世界系下的位姿，把它从原父节点
+            摘下、以其原世界位姿挂到 worldbody 下（即从 URDF 折叠出的场景树中移除），
+            再添加 freejoint。这样调用方无需为自由物体调整 URDF 的层级结构。
+
+        NOTE: urdf2mjcf 把 URDF 的 fixed joint 折叠成了子 body 的 pos/quat，所以父链累积
+        得到的就是该 link 在 URDF 中的世界位姿，提升后其初始世界位姿保持不变。
         """
         add_num = 0
         json_freejoint_bodies = self.json_cfg.worldbody.get("freejoint_body")
         if not isinstance(json_freejoint_bodies, list):
             logger_mjcf.error(f"The freejoint config is invalid when add freejoint.")
             return 0
-        worldbody_bodies = self.worldbody.findall("body")
-        for worldbody_body in worldbody_bodies:
-            if worldbody_body.attrib.get("name") in json_freejoint_bodies:
-                ET.SubElement(worldbody_body, "freejoint", attrib={"name": worldbody_body.attrib.get("name")+"_freejoint"})
-                logger_mjcf.debug(f"Added freejoint to {worldbody_body.attrib.get('name')} from json.")
-                add_num += 1
+
+        for body_name in json_freejoint_bodies:
+            parent, body = MjcfBuilder.__find_body_with_parent(self.worldbody, body_name)
+            if body is None:
+                logger_mjcf.warning(f"freejoint_body '{body_name}' not found in MJCF; skipping.")
+                continue
+
+            if parent is not self.worldbody:
+                # 嵌套 body：累积父链位姿后提升为 worldbody 直接子节点
+                world_pos, world_quat = MjcfBuilder.__accumulate_world_pose(self.worldbody, body)
+                if world_pos is None:
+                    logger_mjcf.error(f"Failed to resolve world pose of nested body '{body_name}'; skipping.")
+                    continue
+                parent.remove(body)
+                body.attrib["pos"] = _vec2str(world_pos)
+                body.attrib["quat"] = _vec2str(world_quat)
+                self.worldbody.append(body)
+                logger_mjcf.info(
+                    f"Promoted nested body '{body_name}' out of the URDF tree to a worldbody "
+                    f"freejoint body (kept its world pose)."
+                )
+
+            ET.SubElement(body, "freejoint", attrib={"name": body_name + "_freejoint"})
+            logger_mjcf.debug(f"Added freejoint to '{body_name}' from json.")
+            add_num += 1
         return add_num
 
     def _resolve_asset_relpath(self, abs_path: Union[str, Path]) -> str:
