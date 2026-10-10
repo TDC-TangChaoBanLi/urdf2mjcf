@@ -10,6 +10,10 @@ and utilities for:
 - Splitting multi-material OBJ files and extracting colors / textures (MTL map_Kd)
 - Extracting URDF `<material><texture>` textures into the meshes directory
 - Optionally running convex decomposition via CoACD (when available)
+- Generating a JSON-driven MJCF: actuators, sensors, sites, cameras, contacts, equality constraints
+- Optional gravity compensation (`gravcomp` / `actuatorgravcomp`)
+- Per-joint force / torque limits (`actuatorfrcrange`, `armature`, `damping`, ...) via `joint_force`
+- Explicit zero-mass `<inertial>` for links that declare no inertia
 
 This package exposes a `urdf2mjcf` console script .
 
@@ -124,8 +128,17 @@ JSON config file example:
             ]
         },
         "gravcomp":{
-            "add_gravcomp": false,          // 设为 true 则为全部 body 开启重力补偿；也可用列表指定 body: ["body_1", "body_2"]
-            "add_actuatorgravcomp": false   // 设为 true 则为全部 joint 开启控制力重力补偿；也可用列表指定 joint: ["joint_1", "joint_2"]
+            "add_gravcomp": false,          // true = enable for all bodies; or a list of body names: ["body_1", "body_2"]
+            "add_actuatorgravcomp": false   // true = enable for all joints; or a list of joint names: ["joint_1", "joint_2"]
+        },
+        "joint_force":{
+            // Per-joint force/torque limits written onto <joint>.
+            // true      -> derive actuatorfrcrange from the URDF <limit effort="...">
+            // "lo hi"   -> shorthand for {"actuatorfrcrange": "lo hi"}
+            // {attr: v} -> any <joint> attribute, e.g. armature / damping
+            "elbow_joint": true,
+            "wrist_joint": "-28 28",
+            "shoulder_joint": {"actuatorfrcrange": "-150 150", "armature": "0.1"}
         },
         "contact":{
             "exclude": [
@@ -184,6 +197,42 @@ LICENSE                      # MIT License
 - ROS package lookup via rospkg or environment variables
 - Automatic search in `/opt/ros` directories
 
+### MJCF Generation
+
+- Driven by the `mjcf_generator` section of the JSON config
+- Actuators (`motor` / `position`), sensors, sites, cameras, lights and contacts
+- `ros2_control` `<hardware><MimicJoint>` support, with correct mimic ordering
+- Joint `scale` values propagated onto MJCF geoms
+- Equality constraints from the `equality` config section
+- Compiler settings (`angle`, `balanceinertia`, ...), world `<option>` (e.g. gravity)
+- Optional default floor / skybox / light
+- Free joints, including promoting a nested body out of the URDF tree to a
+  worldbody free-floating body while preserving its world pose
+
+#### Inertia handling
+
+- Links that declare `<inertial>` are converted with their inertia diagonalized
+- Links that declare **no** inertia get an explicit zero-mass `<inertial>`.
+  Omitting the element is not equivalent: MuJoCo would infer mass from the body
+  geometry (visual meshes use shell inertia = surface area × default density),
+  which silently inflates the model's total mass
+- A link with a movable joint but no `<inertial>` is only warned about — zeroing
+  it would make MuJoCo compilation fail (a moving body must exceed `mjMINVAL`),
+  so the incomplete data is left for the user to fix in the URDF
+
+#### Joint force / torque limits (`joint_force`)
+
+`actuatorfrcrange` caps the *total* actuator force applied to a joint's DOFs,
+gravity compensation included; an actuator's own `forcerange` only caps the
+servo output. Since URDF `<limit effort>` means total joint torque, reproducing
+it faithfully requires a joint-level `actuatorfrcrange`. This is what the
+`joint_force` section is for:
+
+- `true` — derive `actuatorfrcrange` from the URDF `<limit effort="...">`;
+  if the URDF declares no effort, no limit is emitted and a warning is logged
+- `"lo hi"` — shorthand for `{"actuatorfrcrange": "lo hi"}`
+- `{attr: value}` — any `<joint>` attribute, e.g. `armature` or `damping`
+
 ### Optional Features
 
 - OBJ splitting by material
@@ -194,6 +243,9 @@ LICENSE                      # MIT License
 
 **Required:**
 - trimesh >= 3.12.0
+- numpy >= 1.21.0
+- pycollada >= 0.9.3
+- Pillow >= 9.0.0
 
 **Optional:**
 - coacd >= 1.0.0 (for convex decomposition)

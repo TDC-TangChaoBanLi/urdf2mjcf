@@ -374,6 +374,12 @@ class MjcfConfig:
     assets: List[Dict[str, Any]] = field(default_factory=list)
     worldbody: Dict[str, Any] = field(default_factory=dict)
     gravcomp: Dict[str, Any] = field(default_factory=dict)
+    # 关节级力/矩限制覆盖: {"<joint_name>": <spec>, ...}
+    # spec 可以是:
+    #   true            -> 用 URDF <limit effort="..."> 自动生成 actuatorfrcrange
+    #   "lo hi" 字符串  -> 等价于 {"actuatorfrcrange": "lo hi"}
+    #   {属性: 值} 字典  -> 直接写到 <joint> 上（如 actuatorfrcrange / armature / damping）
+    joint_force: Dict[str, Any] = field(default_factory=dict)
     contacts: List[Dict[str, Any]] = field(default_factory=list)
     actuators: List[Dict[str, Any]] = field(default_factory=list)
     equalities: List[Dict[str, Any]] = field(default_factory=list)
@@ -476,6 +482,9 @@ class MjcfConfig:
         gravcomp_json = cls._cfg_get(root, "gravcomp", {}) or {}
         cls.gravcomp = gravcomp_json
 
+        joint_force_json = cls._cfg_get(root, "joint_force", {}) or {}
+        cls.joint_force = joint_force_json
+
         contacts_json = cls._cfg_get(root, "contact", {}) or {}
         cls.contacts = cls._load_labeled_config_list(contacts_json)
 
@@ -516,6 +525,11 @@ class MjcfBuilder:
     EN: MJCF builder and asset/worldbody generator.
     CN: MJCF 构建器：生成 asset/worldbody/actuator/sensor 等块。
     """
+
+    # URDF 中属于"可动"的关节类型 —— 这些 body 在 MJCF 里会带 <joint>，
+    # MuJoCo 要求运动 body 的有效质量大于 mjMINVAL，不能置零。
+    # EN: Joint types that make a body "moving" in MJCF.
+    MOVABLE_JOINT_TYPES = ("revolute", "continuous", "prismatic", "floating", "planar")
 
     def __init__(self, model_name: str, json_cfg: MjcfConfig, urdf_model: UrdfParser, mjcf_path: Path,
                  meshes_dir: Optional[Union[str, Path]] = None, registry=None):
@@ -1322,7 +1336,7 @@ class MjcfBuilder:
         return sub_elem
         
 
-    def _build_body(self, parent: ET.Element[str], link: UrdfParser.UrdfLink, joint:Optional[UrdfParser.UrdfJoint],  asset:ET.Element[str], urdf_file_path: Path = None, mjcf_output_path: Path = None, gravcomp_config: Optional[Dict[str, Any]] = None) -> Optional[ET.Element[str]]:
+    def _build_body(self, parent: ET.Element[str], link: UrdfParser.UrdfLink, joint:Optional[UrdfParser.UrdfJoint],  asset:ET.Element[str], urdf_file_path: Path = None, mjcf_output_path: Path = None, gravcomp_config: Optional[Dict[str, Any]] = None, joint_force_config: Optional[Dict[str, Any]] = None) -> Optional[ET.Element[str]]:
         """
         构建 body 节点
         
@@ -1333,6 +1347,7 @@ class MjcfBuilder:
         :param urdf_file_path: URDF文件路径，用于解析相对路径的mesh
         :param mjcf_output_path: MJCF输出路径，用于生成相对路径
         :param gravcomp_config: 重力补偿配置，包含 add_gravcomp 和 add_actuatorgravcomp
+        :param joint_force_config: 关节级力/矩限制配置，键为 joint 名；见 MjcfConfig.joint_force
         :return: 添加的 body 节点
         """
         # 构建 body
@@ -1382,6 +1397,37 @@ class MjcfBuilder:
                 "diaginertia": _vec2str(diaginertia),
             }
             MjcfBuilder._add_inertial(body, inertial_attribs)
+        elif joint is None or joint.j_type not in MjcfBuilder.MOVABLE_JOINT_TYPES:
+            # URDF 未声明质惯量 -> MJCF 显式置零。
+            #
+            # 不能只是"不写 <inertial>"：只要 body 自带 geom，MuJoCo 就会用 geom
+            # 质量反推 body 质量，而 visual mesh 走 inertia="shell"，算法是
+            # 「网格三角面总面积 x geom 密度(默认 1000 kg/m^3)」。一个中等体积的
+            # 外壳 mesh 就能凭空得到上百公斤，整机质量虚增数倍，Kp / 阻尼整定的
+            # 结论随之全部失效。只有显式写 mass="0" 才真正表达"URDF 没给，按无
+            # 质量处理"。
+            #
+            # EN: URDF declares no inertia -> emit an explicit zero-mass <inertial>.
+            # Omitting <inertial> is NOT the same: MuJoCo would infer the mass
+            # from the body's geometry (mesh shells use area x default density),
+            # which silently inflates the model's total mass.
+            MjcfBuilder._add_inertial(
+                body,
+                {"mass": 0, "pos": "0 0 0", "quat": "1 0 0 0", "diaginertia": "0 0 0"},
+            )
+            logger_mjcf.debug(
+                "Link '%s' declares no <inertial>; emitted zero-mass inertial.", link.l_name
+            )
+        else:
+            # 带可动 joint 却没有 inertial：这是 URDF 数据本身不完整，置零会让
+            # MuJoCo 编译失败（运动 body 质量须大于 mjMINVAL）。转换器只提示，
+            # 不擅自改写物理参数。
+            # EN: Moving body without inertia -> warn, let the user fix the URDF.
+            logger_mjcf.warning(
+                "Link '%s' has a movable joint but declares no <inertial>; "
+                "MuJoCo will infer its mass from geometry.",
+                link.l_name,
+            )
 
         # 构建 joint
         if joint is not None:
@@ -1408,6 +1454,9 @@ class MjcfBuilder:
                         joint_attribs["actuatorgravcomp"] = "true"
                     elif isinstance(add_actuatorgravcomp, list) and joint.j_name in add_actuatorgravcomp:
                         joint_attribs["actuatorgravcomp"] = "true"
+
+                # 关节级力/矩限制 (actuatorfrcrange / armature / damping ...)
+                self._apply_joint_force(joint, joint_attribs, joint_force_config)
 
                 MjcfBuilder._add_joint(body, joint_attribs)
 
@@ -1498,11 +1547,78 @@ class MjcfBuilder:
         return body
 
 
+    @staticmethod
+    def _apply_joint_force(joint: UrdfParser.UrdfJoint, joint_attribs: Dict[str, Any],
+                           joint_force_config: Optional[Dict[str, Any]]) -> None:
+        """把 JSON joint_force 里的关节级限制写到 <joint> 属性上。
+
+        为什么需要 joint 级限制（而不是只靠 actuator 的 forcerange）：
+        MuJoCo 的 mj_fwdActuation() 里顺序是
+
+            force = gain*ctrl + bias
+            force = clamp(force, actuator_forcerange)          <- 只管伺服输出
+            qfrc_actuator = moment' * force
+            if (ngravcomp) qfrc_actuator += qfrc_gravcomp      <- 重力补偿后加进来
+            qfrc_actuator = clamp(qfrc_actuator, jnt_actfrcrange)  <- 关节总力封顶
+
+        也就是说 actuatorfrcrange 限的是"作用在该关节上的全部 actuator 力"，
+        **包含重力补偿**；forcerange 只限伺服那一项。URDF 的 <limit effort> 语义是
+        关节总力矩上限，所以要完整复现它必须给 joint 加 actuatorfrcrange。
+
+        EN: actuatorfrcrange caps the total actuator force on a joint's dofs (gravity
+        compensation included); actuator forcerange only caps the servo output.
+
+        :param joint: URDF joint 对象
+        :param joint_attribs: 待写入的 <joint> 属性字典（原地修改）
+        :param joint_force_config: JSON 的 joint_force 段，键为 joint 名
+        """
+        if not joint_force_config:
+            return
+        spec = joint_force_config.get(joint.j_name)
+        if spec is None:
+            return
+
+        if spec is True:
+            # 用 URDF <limit effort> 自动生成。URDF 未声明 effort（例如 URDF 规范中
+            # 允许省略 <limit> 的关节）时保持不限制，并给出提示 —— 静默套一个猜测值
+            # 比不限制更危险。
+            if joint.limit is None or joint.limit.effort is None:
+                logger_mjcf.warning(
+                    "joint_force['%s']=true but URDF declares no <limit effort>; "
+                    "no actuatorfrcrange emitted.", joint.j_name,
+                )
+                return
+            effort = float(joint.limit.effort)
+            joint_attribs["actuatorfrcrange"] = _vec2str([-effort, effort])
+            logger_mjcf.debug(
+                "Joint '%s': actuatorfrcrange from URDF effort = %s",
+                joint.j_name, joint_attribs["actuatorfrcrange"],
+            )
+            return
+
+        if isinstance(spec, str):
+            # 简写形式 "lo hi"
+            spec = {"actuatorfrcrange": spec}
+
+        if isinstance(spec, dict):
+            for key, value in spec.items():
+                joint_attribs[str(key)] = value if isinstance(value, str) else str(value)
+            logger_mjcf.debug(
+                "Joint '%s': applied joint_force %s", joint.j_name, joint_attribs,
+            )
+            return
+
+        logger_mjcf.error(
+            "joint_force['%s'] has unsupported type %s; expected bool / str / dict.",
+            joint.j_name, type(spec).__name__,
+        )
+
     def build_worldbody_from_urdf(self) -> ET.Element[str]:
         """
         Builds the worldbody from the URDF model
         """
         gravcomp_config = self.json_cfg.gravcomp if self.json_cfg.gravcomp else None
+        joint_force_config = self.json_cfg.joint_force if self.json_cfg.joint_force else None
 
         # 无 joint 的 URDF 可能没有推导出 root_link，兜底取第一个 link
         root_name = self.urdf_model.root_link or (self.urdf_model.links[0].l_name if self.urdf_model.links else None)
@@ -1525,7 +1641,8 @@ class MjcfBuilder:
         root_body: ET.Element[str] = self._build_body(self.worldbody, urdf_link, urdf_joint, asset=self.asset, 
                                                             urdf_file_path=self.urdf_model.urdf_file_path, 
                                                             mjcf_output_path=self.mjcf_path,
-                                                            gravcomp_config=gravcomp_config)
+                                                            gravcomp_config=gravcomp_config,
+                                                            joint_force_config=joint_force_config)
         
         def rec_build_bodies(parent_elem: ET.Element[str],):
             """
@@ -1546,7 +1663,8 @@ class MjcfBuilder:
                     body = self._build_body(parent_elem, urdf_link, urdf_joint, asset=self.asset, 
                                                    urdf_file_path=self.urdf_model.urdf_file_path, 
                                                    mjcf_output_path=self.mjcf_path,
-                                                   gravcomp_config=gravcomp_config)
+                                                   gravcomp_config=gravcomp_config,
+                                                   joint_force_config=joint_force_config)
 
                     rec_build_bodies(body)
 
@@ -1733,7 +1851,7 @@ def mjcf_generator(
 if __name__ == "__main__":
     # EN: Do not configure logging here; the CLI is the recommended entry.
     # CN: 这里不配置 logging；推荐从 CLI 调用。
-    urdf_path="./examples/urdf/UR5e_fixed_0.urdf"
+    urdf_path="./examples/urdf/robot.urdf"
     urdf_model = UrdfParser.parse_urdf(urdf_path)
-    mjcf_generator(urdf_model=urdf_model, mjcf_path="./examples/mjcf/UR5e0.xml", json_config_path="./examples/config/config.json")
+    mjcf_generator(urdf_model=urdf_model, mjcf_path="./examples/mjcf/robot.xml", json_config_path="./examples/config/config.json")
     pass

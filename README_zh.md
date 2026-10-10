@@ -10,6 +10,10 @@
 - 按材质分解多材质 OBJ 并提取颜色/贴图（MTL map_Kd）
 - 提取 URDF `<material><texture>` 贴图并落地到 meshes 目录
 - 在安装 CoACD 时可选择进行凸包分解
+- 由 JSON 配置驱动生成 MJCF：执行器、传感器、site、相机、接触、约束
+- 可选重力补偿（`gravcomp` / `actuatorgravcomp`）
+- 通过 `joint_force` 配置关节级力/矩限制（`actuatorfrcrange`、`armature`、`damping` 等）
+- 为未声明质惯量的 link 显式写入零质量 `<inertial>`
 
 提供命令行工具 `urdf2mjcf` 。
 
@@ -127,6 +131,15 @@ JSON 配置文件示例:
             "add_gravcomp": false,          // 设为 true 则为全部 body 开启重力补偿；也可用列表指定 body: ["body_1", "body_2"]
             "add_actuatorgravcomp": false   // 设为 true 则为全部 joint 开启控制力重力补偿；也可用列表指定 joint: ["joint_1", "joint_2"]
         },
+        "joint_force":{
+            // 关节级力/矩限制，写到 <joint> 上。
+            // true      -> 用 URDF <limit effort="..."> 自动生成 actuatorfrcrange
+            // "lo hi"   -> {"actuatorfrcrange": "lo hi"} 的简写
+            // {attr: v} -> 任意 <joint> 属性，例如 armature / damping
+            "elbow_joint": true,
+            "wrist_joint": "-28 28",
+            "shoulder_joint": {"actuatorfrcrange": "-150 150", "armature": "0.1"}
+        },
         "contact":{
             "exclude": [
                 {"body1": "robotiq_85_left_finger_tip_link", "body2": "robotiq_85_left_inner_knuckle_link"},
@@ -175,11 +188,46 @@ LICENSE                      # MIT 许可证
 - 绝对/相对路径智能转换
 - 符号链接支持
 
+### MJCF 生成
+
+- 由 JSON 配置中的 `mjcf_generator` 段驱动
+- 执行器（`motor` / `position`）、传感器、site、相机、灯光与接触
+- 支持 `ros2_control` 的 `<hardware><MimicJoint>`，且 mimic 关节顺序正确
+- 关节 `scale` 正确写入 MJCF geom
+- 由 `equality` 配置段生成约束（equality）
+- 编译器设置（`angle`、`balanceinertia` 等）与世界 `<option>`（如重力）
+- 可选的默认地面 / 天空盒 / 光源
+- 自由关节：支持把嵌套 body 从 URDF 树中提升为 worldbody 下的自由漂浮 body，
+  并保持其原有世界位姿
+
+#### 质惯量处理
+
+- 声明了 `<inertial>` 的 link：转换其惯量并对角化后写入
+- **未**声明质惯量的 link：显式写入零质量 `<inertial>`。不能简单地不写该元素——
+  只要 body 自带 geom，MuJoCo 就会用几何体反推质量（visual mesh 走 shell 惯量，
+  即「三角面总面积 × 默认密度」），导致整机质量被静默放大
+- 带可动关节却没有 `<inertial>` 的 link：仅给出告警，不擅自置零——置零会让 MuJoCo
+  编译失败（运动 body 的质量必须大于 `mjMINVAL`），数据不完整时应由用户修正 URDF
+
+#### 关节级力/矩限制（`joint_force`）
+
+`actuatorfrcrange` 限制的是「作用在该关节自由度上的全部 actuator 力」（**包含**重力
+补偿），而 actuator 自身的 `forcerange` 只限制伺服输出项。URDF `<limit effort>` 的语义
+是关节总力矩上限，要完整复现它必须使用关节级的 `actuatorfrcrange`，这正是
+`joint_force` 配置段的用途：
+
+- `true` —— 用 URDF `<limit effort="...">` 自动生成 `actuatorfrcrange`；若 URDF
+  未声明 effort，则不生成限制并输出告警
+- `"lo hi"` —— `{"actuatorfrcrange": "lo hi"}` 的简写
+- `{attr: value}` —— 任意 `<joint>` 属性，例如 `armature` 或 `damping`
+
 ### 依赖项
 
 **必需：**
 - trimesh >= 3.12.0
 - numpy >= 1.21.0
+- pycollada >= 0.9.3
+- Pillow >= 9.0.0
 
 **可选：**
 - coacd >= 1.0.0（凸包分解）

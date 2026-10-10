@@ -673,9 +673,9 @@ if __name__ == "__main__":
     import logging
 
     logging.basicConfig(level=logging.INFO)
-    urdf_path = "./examples/urdf/UR5e.urdf"
+    urdf_path = "./examples/urdf/robot.urdf"
     json_path = "./examples/config/config.json"
-    meshes_dir = "./examples/meshes_0/"
+    meshes_dir = "./examples/meshes/"
 
     urdf_model = UrdfParser.parse_urdf(urdf_path)
     mesh_converter(
